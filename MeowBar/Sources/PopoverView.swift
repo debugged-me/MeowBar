@@ -13,22 +13,17 @@ struct PopoverView: View {
     }
 
     private var content: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 7) {
-                if let icon = Bundle.main.image(forResource: "icon") {
-                    Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 22, height: 22)
-                }
-                Text("MeowBar").font(.headline)
-            }
-            .padding(.horizontal, 2)
-
+        // Flat list, battery-menu style: no header, providers separated by
+        // hairline dividers only.
+        VStack(alignment: .leading, spacing: 9) {
             ProviderBlock(usage: store.claude, running: store.claudeRunning, store: store)
+            Divider()
             ProviderBlock(usage: store.codex, running: store.codexRunning, store: store)
             if store.devin.isVisible {
+                Divider()
                 ProviderBlock(usage: store.devin, running: store.devinRunning, store: store)
             }
-
+            Divider()
             HStack {
                 Spacer()
                 Button {
@@ -41,10 +36,9 @@ struct PopoverView: View {
                 .help("Settings")
                 Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
             }
-            .padding(.horizontal, 2)
         }
         .padding(12)
-        .frame(width: 300)
+        .frame(width: 290)
     }
 }
 
@@ -107,8 +101,6 @@ struct ProviderBlock: View {
                 WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
-        .padding(10)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -116,9 +108,6 @@ struct WindowRow: View {
     let title: String
     let w: UsageWindow?
     var tint: Color = .accentColor
-
-    private static let timeFmt: Date.FormatStyle = .dateTime.hour().minute()
-    private static let dayFmt: Date.FormatStyle = .dateTime.weekday(.abbreviated).hour().minute()
 
     var body: some View {
         if let w {
@@ -163,8 +152,7 @@ struct WindowRow: View {
     private var resetText: String {
         guard let reset = w?.resetsAt else { return "" }
         if reset <= Date() { return "resetting now" }
-        let sameDay = Calendar.current.isDate(reset, inSameDayAs: Date())
-        return "resets \(Notifier.countdown(to: reset)) · \(reset.formatted(sameDay ? Self.timeFmt : Self.dayFmt))"
+        return "resets \(Notifier.countdown(to: reset))"
     }
 
     // Projected usage at reset (linear burn since the window opened) → a
