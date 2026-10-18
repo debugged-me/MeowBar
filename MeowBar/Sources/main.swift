@@ -34,11 +34,12 @@ final class UsageStore: ObservableObject {
     // "<claude-glyph> <pct>%   <codex-glyph> <pct>%" — each provider's worst
     // window (5h or 7d), severity-tinted. 🐱 alone until first data arrives.
     var menuTitle: NSAttributedString {
-        // <claude logo> <pct>%   <codex blossom> <pct>% — session window each,
-        // severity-tinted. Glyphs are template images so they track the menu bar.
-        func entry(_ resource: String, _ pct: Double?) -> NSAttributedString {
-            let color: NSColor = pct == nil ? .secondaryLabelColor
-                : pct! >= 90 ? .systemRed : pct! >= 75 ? .systemOrange : .labelColor
+        // <claude logo> <session>%   <codex blossom> <session>% — number is the
+        // session window; color follows the WORST window so a maxed weekly
+        // (provider unusable) shows red even when the session reads 0%.
+        func entry(_ resource: String, _ pct: Double?, _ sev: Double?) -> NSAttributedString {
+            let color: NSColor = sev == nil ? .secondaryLabelColor
+                : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
                let img = NSImage(contentsOf: url) {
@@ -54,9 +55,20 @@ final class UsageStore: ObservableObject {
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("claude", claude.session?.usedPercent))
+        // Number = session % left, unless the weekly is nearly exhausted
+        // (≥90% used → it blocks you regardless) — then show weekly % left.
+        // Color = worst % used across both windows.
+        func disp(_ u: ProviderUsage) -> Double? {
+            let s = u.session?.usedPercent, w = u.weekly?.usedPercent
+            if let w, w >= 90 { return 100 - w }
+            return (s ?? w).map { 100 - $0 }
+        }
+        func worstUsed(_ u: ProviderUsage) -> Double? {
+            [u.session, u.weekly].compactMap { $0 }.map(\.usedPercent).max()
+        }
+        t.append(entry("claude", disp(claude), worstUsed(claude)))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", codex.session?.usedPercent))
+        t.append(entry("codex", disp(codex), worstUsed(codex)))
         return t
     }
 
@@ -64,8 +76,8 @@ final class UsageStore: ObservableObject {
         func line(_ u: ProviderUsage) -> String {
             let s = u.session?.usedPercent, w = u.weekly?.usedPercent
             let nums = [
-                s.map { String(format: "5h %.0f%%", $0) },
-                w.map { String(format: "7d %.0f%%", $0) },
+                s.map { String(format: "5h %.0f%% left", 100 - $0) },
+                w.map { String(format: "7d %.0f%% left", 100 - $0) },
             ].compactMap { $0 }.joined(separator: " · ")
             return "\(u.name): " + (nums.isEmpty ? (u.error ?? "…") : nums)
         }

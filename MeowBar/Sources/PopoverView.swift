@@ -87,19 +87,20 @@ struct WindowRow: View {
         return "resets \(Notifier.countdown(to: reset)) · \(reset.formatted(sameDay ? Self.timeFmt : Self.dayFmt))"
     }
 
+    // Warnings only: "maxed", or "expected out" when actually running low —
+    // burning ahead of pace and (≥70% used or capping within the hour).
+    // "on pace" / "window just reset" are intentionally hidden to save space.
     private var paceText: String {
         guard let w, let win = w.windowSeconds, let reset = w.resetsAt else { return "" }
+        if w.usedPercent >= 100 { return "maxed" }
         let remaining = reset.timeIntervalSinceNow
         let elapsed = win - remaining
-        guard elapsed > 120 else { return "window just reset" }
+        guard elapsed > 120 else { return "" }
         let usedFrac = w.usedPercent / 100
-        let elapsedFrac = elapsed / win
-        guard usedFrac > elapsedFrac else { return "on pace" }
+        guard usedFrac > elapsed / win else { return "" }
         let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
-        if secondsToFull < remaining {
-            let early = Date().addingTimeInterval(secondsToFull)
-            return "runs out ~\(early.formatted(date: .omitted, time: .shortened))"
-        }
-        return "on pace"
+        guard secondsToFull < remaining,
+              w.usedPercent >= 70 || secondsToFull <= 3600 else { return "" }
+        return "expected out \(Notifier.countdown(to: Date().addingTimeInterval(secondsToFull)))"
     }
 }
