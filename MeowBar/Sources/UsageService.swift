@@ -396,6 +396,150 @@ private struct DevinCredential {
     var apiServerURL: String
 }
 
+// Codex persists explicit task_started/task_complete markers in each local
+// rollout. Reading those markers is more accurate than CPU alone because an
+// IDE task remains active while it waits on the model or a tool. Files are
+// consumed incrementally, so the 2-second activity check only reads new bytes.
+private final class CodexTurnTracker: @unchecked Sendable {
+    private struct State {
+        var offset: UInt64 = 0
+        var active = false
+    }
+
+    private var states: [String: State] = [:]
+    private let lock = NSLock()
+
+    func isActive(rolloutPath: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let handle = FileHandle(forReadingAtPath: rolloutPath) else { return false }
+        defer { try? handle.close() }
+
+        let end = handle.seekToEndOfFile()
+        var state = states[rolloutPath] ?? State()
+        if end < state.offset { state = State() }
+        // Small overlap protects against observing a line while it is being
+        // appended. Reprocessing a marker is harmless because it is a state.
+        let start = state.offset == 0 ? 0 : state.offset - min(state.offset, 4096)
+        handle.seek(toFileOffset: start)
+        let data = handle.readDataToEndOfFile()
+        for line in data.split(separator: 0x0A) {
+            guard let json = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  json["type"] as? String == "event_msg",
+                  let payload = json["payload"] as? [String: Any],
+                  let marker = payload["type"] as? String else { continue }
+            if marker == "task_started" { state.active = true }
+            if marker == "task_complete" { state.active = false }
+        }
+        state.offset = end
+        states[rolloutPath] = state
+        return state.active
+    }
+}
+
+private let codexTurnTracker = CodexTurnTracker()
+
+private final class ClaudeTurnTracker: @unchecked Sendable {
+    private struct State {
+        var offset: UInt64 = 0
+        var active = false
+    }
+
+    private var states: [String: State] = [:]
+    private var candidates: [String] = []
+    private var discoverAfter = Date.distantPast
+    private let lock = NSLock()
+
+    func hasActiveTurn() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        if now >= discoverAfter {
+            candidates = discoverRecentTranscripts()
+            discoverAfter = now.addingTimeInterval(10)
+        }
+        for path in candidates {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let modified = attrs[.modificationDate] as? Date,
+                  now.timeIntervalSince(modified) < 15 * 60 else { continue }
+            if update(path: path) { return true }
+        }
+        return false
+    }
+
+    private func discoverRecentTranscripts() -> [String] {
+        let root = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/projects")
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+        var found: [(String, Date)] = []
+        for case let url as URL in walker where url.pathExtension == "jsonl" {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true,
+                  let modified = values.contentModificationDate else { continue }
+            found.append((url.path, modified))
+        }
+        return found.sorted { $0.1 > $1.1 }.prefix(12).map(\.0)
+    }
+
+    private func update(path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let end = handle.seekToEndOfFile()
+        var state = states[path] ?? State()
+        if end < state.offset { state = State() }
+        let start = state.offset == 0 ? 0 : state.offset - min(state.offset, 4096)
+        handle.seek(toFileOffset: start)
+        let data = handle.readDataToEndOfFile()
+        for line in data.split(separator: 0x0A) {
+            guard let json = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let type = json["type"] as? String else { continue }
+            if type == "user" { state.active = true }
+            if type == "assistant",
+               let message = json["message"] as? [String: Any],
+               let stop = message["stop_reason"] as? String {
+                if stop == "end_turn" || stop == "stop_sequence" { state.active = false }
+                else if stop == "tool_use" { state.active = true }
+            }
+        }
+        state.offset = end
+        states[path] = state
+        return state.active
+    }
+}
+
+private let claudeTurnTracker = ClaudeTurnTracker()
+
+private func codexIDEHasActiveTask() -> Bool {
+    let codexHome = NSHomeDirectory() + "/.codex"
+    let fm = FileManager.default
+    let candidates = ((try? fm.contentsOfDirectory(atPath: codexHome)) ?? [])
+        .filter { $0.range(of: #"^state_[0-9]+\.sqlite$"#, options: .regularExpression) != nil }
+        .map { codexHome + "/" + $0 }
+        .sorted {
+            let a = (try? fm.attributesOfItem(atPath: $0)[.modificationDate] as? Date) ?? .distantPast
+            let b = (try? fm.attributesOfItem(atPath: $1)[.modificationDate] as? Date) ?? .distantPast
+            return a > b
+        }
+    guard let dbPath = candidates.first else { return false }
+
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return false }
+    defer { sqlite3_close(db) }
+    var stmt: OpaquePointer?
+    let sql = "SELECT rollout_path FROM threads WHERE archived = 0 ORDER BY updated_at_ms DESC LIMIT 4"
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+    defer { sqlite3_finalize(stmt) }
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        guard let cPath = sqlite3_column_text(stmt, 0) else { continue }
+        let path = String(cString: cPath)
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modified) < 15 * 60 else { continue }
+        if codexTurnTracker.isActive(rolloutPath: path) { return true }
+    }
+    return false
+}
+
 private func loadDevinCredential() throws -> DevinCredential {
     let sessions = try devinSecret("windsurf_auth.sessions")
     let server = (try? devinSecret("windsurf_auth.apiServerUrl")) ?? "https://server.codeium.com"
@@ -418,15 +562,21 @@ enum UsageService {
         // ucomm is the executable name on macOS; comm is a truncated path and
         // can hide `codex`/`claude` when they live inside an editor extension.
         let (_, out) = runProcess("/bin/ps", ["-A", "-o", "pid=", "-o", "%cpu=", "-o", "ucomm="])
+        let codexTurnActive = codexIDEHasActiveTask()
+        let claudeTurnActive = claudeTurnTracker.hasActiveTurn()
         var c = false, x = false, d = false
+        var claudeExists = false, codexExists = false
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
             guard parts.count >= 3, let pid = Int32(parts[0]),
-                  let cpu = Double(parts[1]), cpu > 1.5 else { continue }
+                  let cpu = Double(parts[1]) else { continue }
+            let executable = String(parts[2]).trimmingCharacters(in: .whitespaces)
             // Ignore only the short-lived app-server MeowBar itself launches
             // for usage data. An IDE-owned app-server can represent real work.
             if meowbarCodexProcesses.contains(pid) { continue }
-            let executable = String(parts[2]).trimmingCharacters(in: .whitespaces)
+            if executable == "claude" { claudeExists = true }
+            if executable == "codex" { codexExists = true }
+            guard cpu > 1.5 else { continue }
             switch executable {
             case "claude": c = true
             case "codex": x = true
@@ -434,6 +584,8 @@ enum UsageService {
             default: break
             }
         }
+        c = c || (claudeExists && claudeTurnActive)
+        x = x || (codexExists && codexTurnActive)
         return (c, x, d)
     }
 

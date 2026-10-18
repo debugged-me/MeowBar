@@ -26,7 +26,7 @@ final class UsageStore: ObservableObject {
     private var idleSamples: [String: Int] = [:]
     private var confirmedRunning: [String: Bool] = [:]
     private var prevWorst: [String: Double] = [:]
-    private let alertTTL: TimeInterval = 60
+    private let alertTTL: TimeInterval = 15
     private var demoActive = false
 
     func start() {
@@ -190,8 +190,8 @@ final class UsageStore: ObservableObject {
     }
 
     var menuTitle: NSAttributedString {
-        // <logo> <state>: live alert word (armed on edges, expires after
-        // alertTTL or on click) > "running" while the CLI is busy > % left.
+        // Always keep the usage metric visible. Transient state is appended,
+        // so an alert or running task never hides the useful percentage.
         func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
                    _ resetAt: Date?, _ running: Bool) -> NSAttributedString {
             let color: NSColor = sev == nil ? .secondaryLabelColor
@@ -203,26 +203,45 @@ final class UsageStore: ObservableObject {
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }
-            let label: String
-            var attrs: [NSAttributedString.Key: Any] = [.foregroundColor: color]
-            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
-                label = " " + alert
-                attrs[.foregroundColor] = alert == "task done" ? NSColor.systemGreen : NSColor.systemRed
-                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-            } else if running {
-                label = " running"
-                attrs[.foregroundColor] = NSColor.systemGreen
-                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+
+            let mode = UserDefaults.standard.string(forKey: "meowbar.displayMode") ?? "percent"
+            let metric: String
+            if mode == "countdown", let reset = resetAt {
+                metric = Self.compactCountdown(to: reset)
             } else {
-                let mode = UserDefaults.standard.string(forKey: "meowbar.displayMode") ?? "percent"
-                if mode == "countdown", let reset = resetAt {
-                    label = " \(Self.compactCountdown(to: reset))"
-                } else {
-                    label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
-                }
-                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+                metric = pct.map { String(format: "%.0f%%", $0) } ?? "–"
             }
-            s.append(NSAttributedString(string: label, attributes: attrs))
+            s.append(NSAttributedString(
+                string: " " + metric,
+                attributes: [
+                    .foregroundColor: color,
+                    .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+                ]))
+
+            let status: String?
+            let statusColor: NSColor
+            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
+                status = alert
+                switch alert {
+                case "task done": statusColor = .systemGreen
+                case "nearing limit": statusColor = .systemOrange
+                default: statusColor = .systemRed
+                }
+            } else if running {
+                status = "running"
+                statusColor = .systemGreen
+            } else {
+                status = nil
+                statusColor = .labelColor
+            }
+            if let status {
+                s.append(NSAttributedString(
+                    string: " · \(status)",
+                    attributes: [
+                        .foregroundColor: statusColor,
+                        .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+                    ]))
+            }
             return s
         }
         let t = NSMutableAttributedString()
