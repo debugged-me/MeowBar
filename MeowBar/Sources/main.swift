@@ -15,7 +15,7 @@ final class UsageStore: ObservableObject {
     private var alertUntil: [String: Date] = [:]
     private var prevRunning: [String: Bool] = [:]
     private var prevWorst: [String: Double] = [:]
-    private let alertTTL: TimeInterval = 120
+    private let alertTTL: TimeInterval = 60
 
     func start() {
         refresh()
