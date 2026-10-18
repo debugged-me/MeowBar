@@ -29,6 +29,7 @@ struct PopoverView: View {
         }
         .padding(12)
         .frame(width: 300)
+        .background(.ultraThickMaterial) // near-opaque backing — popover stays readable over light windows
     }
 }
 

@@ -156,6 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.delegate = self
+        popover.appearance = NSAppearance(named: .darkAqua)
         let host = NSHostingController(rootView: PopoverView(store: store))
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
