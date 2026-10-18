@@ -105,6 +105,21 @@ final class UsageStore: ObservableObject {
         return (s ?? w).map { 100 - $0 }
     }
 
+    // The window the bar is displaying — same rule as dispLeft.
+    static func dispReset(_ u: ProviderUsage) -> Date? {
+        if let w = u.weekly, w.usedPercent >= 90 { return w.resetsAt }
+        return u.session?.resetsAt ?? u.weekly?.resetsAt
+    }
+
+    // "4h59m" / "6d10h" — compact for the countdown display mode.
+    static func compactCountdown(to date: Date) -> String {
+        let s = max(0, Int(date.timeIntervalSinceNow))
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        if d > 0 { return "\(d)d\(h)h" }
+        if h > 0 { return "\(h)h\(m)m" }
+        return "\(m)m"
+    }
+
     private func arm(_ name: String, _ text: String, now: Date) {
         alertText[name] = text
         alertUntil[name] = now.addingTimeInterval(alertTTL)
@@ -117,16 +132,40 @@ final class UsageStore: ObservableObject {
         onUpdate?()
     }
 
+    // The icon IS the meter: it fills bottom-up with used% — ghosted icon as
+    // track, full-color icon rising with usage (severity tints via text).
+    private func iconImage(_ resource: String, fillFrac f: Double?) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
+              let src = NSImage(contentsOf: url) else { return nil }
+        guard let f, f > 0.005 else {
+            src.size = NSSize(width: 16, height: 16)
+            return src
+        }
+        let size = NSSize(width: 16, height: 16)
+        let img = NSImage(size: size, flipped: false) { rect in
+            src.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.25)
+            let ctx = NSGraphicsContext.current
+            ctx?.saveGraphicsState()
+            ctx?.cgContext.clip(to: CGRect(x: 0, y: 0,
+                                           width: rect.width,
+                                           height: rect.height * min(max(f, 0), 1)))
+            src.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+            ctx?.restoreGraphicsState()
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
     var menuTitle: NSAttributedString {
         // <logo> <state>: live alert word (armed on edges, expires after
         // alertTTL or on click) > "running" while the CLI is busy > % left.
-        func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?, _ running: Bool) -> NSAttributedString {
-            var color: NSColor = sev == nil ? .secondaryLabelColor
+        func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
+                   _ resetAt: Date?, _ running: Bool) -> NSAttributedString {
+            let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
-            if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
-               let img = NSImage(contentsOf: url) {
-                img.isTemplate = false // keep brand colors; template only tinted on click
+            if let img = iconImage(resource, fillFrac: pct.map { (100 - $0) / 100 }) {
                 img.size = NSSize(width: 16, height: 16)
                 let att = NSTextAttachment()
                 att.image = img
@@ -144,16 +183,23 @@ final class UsageStore: ObservableObject {
                 attrs[.foregroundColor] = NSColor.systemGreen
                 attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             } else {
-                label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
-                attrs[.font] = NSFont.systemFont(ofSize: 12, weight: .medium)
+                let mode = UserDefaults.standard.string(forKey: "meowbar.displayMode") ?? "percent"
+                if mode == "countdown", let reset = resetAt {
+                    label = " \(Self.compactCountdown(to: reset))"
+                } else {
+                    label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
+                }
+                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
             }
             s.append(NSAttributedString(string: label, attributes: attrs))
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("claude", "Claude", Self.dispLeft(claude), Self.worstUsed(claude), claudeRunning))
+        t.append(entry("claude", "Claude", Self.dispLeft(claude), Self.worstUsed(claude),
+                       Self.dispReset(claude), claudeRunning))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", "Codex", Self.dispLeft(codex), Self.worstUsed(codex), codexRunning))
+        t.append(entry("codex", "Codex", Self.dispLeft(codex), Self.worstUsed(codex),
+                       Self.dispReset(codex), codexRunning))
         return t
     }
 
@@ -175,6 +221,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     let store = UsageStore()
+    private var settingsWindow: NSWindow?
+    private var islandPanel: NSPanel?
+    private var islandField: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -183,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.target = self
 
-        popover.behavior = .transient
+        popover.behavior = .semitransient // detaches when dragged into a window
         popover.delegate = self
         let host = NSHostingController(rootView: PopoverView(store: store))
         host.sizingOptions = .preferredContentSize
@@ -193,9 +242,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.statusItem.button?.attributedTitle = self.store.menuTitle
             self.statusItem.button?.toolTip = self.store.menuToolTip
+            self.layoutIsland()
         }
         store.start()
         Notifier.requestPermission()
+
+        applyPosition()
+        NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.applyPosition()
+            self?.store.onUpdate?()
+            self?.store.refresh()
+        }
+        NotificationCenter.default.addObserver(forName: .init("meowbar.openSettings"),
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.openSettings()
+        }
 
         // .transient is unreliable for accessory apps — explicitly close on
         // any outside click while the popover is up.
@@ -211,24 +273,142 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: Settings window
+
+    func openSettings() {
+        if settingsWindow == nil {
+            let host = NSHostingController(rootView: SettingsView())
+            let w = NSWindow(contentViewController: host)
+            w.title = "MeowBar Settings"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.level = .floating
+            settingsWindow = w
+        }
+        settingsWindow?.center()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: Positions — right (status item) or middle ("island" at top edge)
+
+    func applyPosition() {
+        let pos = UserDefaults.standard.string(forKey: "meowbar.position") ?? "right"
+        if pos == "middle" {
+            statusItem.isVisible = false
+            showIsland()
+        } else {
+            islandPanel?.orderOut(nil)
+            statusItem.isVisible = true
+        }
+        store.onUpdate?()
+    }
+
+    private func showIsland() {
+        if islandPanel == nil {
+            let p = NSPanel(contentRect: .zero,
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.level = .statusBar            // draws over the menu bar region
+            p.isFloatingPanel = true
+            p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = false
+
+            let bg = IslandView()
+            bg.onClick = { [weak self] in self?.togglePopover() }
+            let tf = NSTextField(labelWithAttributedString: NSAttributedString())
+            tf.drawsBackground = false
+            bg.addSubview(tf)
+            p.contentView = bg
+            islandPanel = p
+            islandField = tf
+        }
+        islandPanel?.orderFrontRegardless()
+        layoutIsland()
+    }
+
+    private func layoutIsland() {
+        guard let p = islandPanel, let tf = islandField,
+              let screen = NSScreen.main, p.isVisible else { return }
+        let title = store.menuTitle
+        tf.attributedStringValue = title
+        tf.sizeToFit() // attributed .size() under-measures image attachments
+        let sz = tf.fittingSize
+        let pad: CGFloat = 12, h: CGFloat = 26
+        let w = sz.width + pad * 2
+        // Hang just below the notch/menu area: safeAreaInsets.top covers the
+        // notch on modern MacBooks, 0 elsewhere (sits flush at top edge).
+        let drop = screen.safeAreaInsets.top
+        let y = screen.frame.maxY - drop - h - 2
+        p.setFrame(NSRect(x: screen.frame.midX - w / 2, y: y, width: w, height: h),
+                   display: true)
+        tf.frame = NSRect(x: pad, y: 3, width: sz.width, height: h - 6)
+    }
+
     @objc private func togglePopover() {
-        guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
-        } else {
-            store.acknowledgeAlerts()
-            store.refresh()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            // Key window → controls render true tint colors (inactive windows
-            // draw them grayed) and keyDown events reach the local monitor.
-            NSApp.activate(ignoringOtherApps: true)
+            return
         }
+        store.acknowledgeAlerts()
+        store.refresh()
+        if let bg = islandPanel?.contentView, islandPanel?.isVisible == true {
+            popover.show(relativeTo: bg.bounds, of: bg, preferredEdge: .minY)
+        } else if let button = statusItem.button {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+        // Key window → controls render true tint colors (inactive windows
+        // draw them grayed) and keyDown events reach the local monitor.
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+}
+
+// The island's capsule view: glass background, dimmed at rest, brightens on
+// hover, click opens the popover.
+private final class IslandView: NSVisualEffectView {
+    var onClick: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .popover
+        blendingMode = .behindWindow
+        state = .active
+        wantsLayer = true
+        layer?.cornerRadius = 13
+        alphaValue = 0.85
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseEntered(with event: NSEvent) { animator().alphaValue = 1.0 }
+    override func mouseExited(with event: NSEvent) { animator().alphaValue = 0.85 }
+    override func mouseUp(with event: NSEvent) {
+        if event.clickCount == 1 { onClick?() }
     }
 }
 
 extension AppDelegate: NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         NSApp.deactivate()
+    }
+
+    func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }
+
+    // Dragging the popover off the bar detaches it into a floating window.
+    func detachableWindow(for popover: NSPopover) -> NSWindow? {
+        let host = NSHostingController(rootView: PopoverView(store: store))
+        let w = NSWindow(contentViewController: host)
+        w.title = "MeowBar"
+        w.styleMask = [.titled, .closable]
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+        return w
     }
 }
 

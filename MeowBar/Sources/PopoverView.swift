@@ -21,18 +21,24 @@ struct PopoverView: View {
                 }
                 Text("MeowBar").font(.headline)
             }
-            ProviderBlock(usage: store.claude, running: store.claudeRunning)
+            ProviderBlock(usage: store.claude, running: store.claudeRunning, store: store)
             Divider()
-            ProviderBlock(usage: store.codex, running: store.codexRunning)
+            ProviderBlock(usage: store.codex, running: store.codexRunning, store: store)
             if store.devin.isVisible {
                 Divider()
-                ProviderBlock(usage: store.devin, running: store.devinRunning)
+                ProviderBlock(usage: store.devin, running: store.devinRunning, store: store)
             }
             Divider()
             HStack {
-                Text("Updated " + (store.lastUpdated?.formatted(date: .omitted, time: .shortened) ?? "never"))
-                    .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                Button {
+                    NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
+                } label: {
+                    Image(systemName: "gearshape").font(.caption)
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderless)
+                .help("Settings")
                 Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
             }
         }
@@ -44,6 +50,7 @@ struct PopoverView: View {
 struct ProviderBlock: View {
     let usage: ProviderUsage
     var running: Bool = false
+    var store: UsageStore? = nil
 
     private var brandColor: Color {
         switch usage.name {
@@ -63,22 +70,27 @@ struct ProviderBlock: View {
             }
             if let err = usage.error {
                 Text(err).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                if let action = usage.action {
+                    Button(action.title) {
+                        UsageService.perform(action)
+                        store?.refresh()
+                    }
+                    .controlSize(.small)
+                }
             }
-            // Skip "—" placeholders when the error already explains missing data
+            // Plan line sits above the bars (unlimited plans have no bars).
             if usage.note != nil || usage.noteAccent != nil {
                 HStack(spacing: 4) {
                     if let note = usage.note { Text(note).foregroundStyle(.secondary) }
                     if let accent = usage.noteAccent { Text(accent).foregroundStyle(.green) }
                 }
                 .font(.caption)
-            } else {
+            }
+            let unlimited = usage.noteAccent == "unlimited" && !usage.hasData
+            if !unlimited && (usage.hasData || usage.error == nil) {
                 let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
-                if usage.session != nil || usage.error == nil {
-                    WindowRow(title: sessionLabel, w: usage.session, tint: brandColor)
-                }
-                if usage.weekly != nil || usage.error == nil {
-                    WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
-                }
+                WindowRow(title: sessionLabel, w: usage.session, tint: brandColor)
+                WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
     }
@@ -130,20 +142,23 @@ struct WindowRow: View {
         return "resets \(Notifier.countdown(to: reset)) · \(reset.formatted(sameDay ? Self.timeFmt : Self.dayFmt))"
     }
 
-    // Warnings only: "maxed", or "expected out" when actually running low —
-    // burning ahead of pace and (≥70% used or capping within the hour).
-    // "on pace" / "window just reset" are intentionally hidden to save space.
+    // Projected usage at reset (linear burn since the window opened) → a
+    // one-word verdict. Hidden for the first 10 min of a window — too noisy.
     private var paceText: String {
         guard let w, let win = w.windowSeconds, let reset = w.resetsAt else { return "" }
         if w.usedPercent >= 100 { return "maxed" }
         let remaining = reset.timeIntervalSinceNow
         let elapsed = win - remaining
-        guard elapsed > 120 else { return "" }
+        guard elapsed > 600 else { return "" }
         let usedFrac = w.usedPercent / 100
-        guard usedFrac > elapsed / win else { return "" }
-        let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
-        guard secondsToFull < remaining,
-              w.usedPercent >= 70 || secondsToFull <= 3600 else { return "" }
-        return "expected out \(Notifier.countdown(to: Date().addingTimeInterval(secondsToFull)))"
+        let projected = usedFrac * win / elapsed
+        if projected >= 1 {
+            let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
+            guard secondsToFull < remaining else { return "cutting it close" }
+            return "hit limit \(Notifier.countdown(to: Date().addingTimeInterval(secondsToFull)))"
+        }
+        if projected < 0.55 { return "plenty left" }
+        if projected < 0.85 { return "comfortable" }
+        return "cutting it close"
     }
 }

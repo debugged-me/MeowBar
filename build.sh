@@ -12,6 +12,12 @@ swiftc -O -target arm64-apple-macos14.0 \
     -o "$APP/Contents/MacOS/MeowBar" \
     MeowBar/Sources/*.swift
 
+# statusline helper — installed as Claude Code's statusLine command when the
+# "Always fresh" setting is enabled (pushes rate_limits to us, zero polling)
+swiftc -O -target arm64-apple-macos14.0 \
+    -o "$APP/Contents/MacOS/meowbar-statusline" \
+    MeowBar/Sources/statusline/main.swift
+
 codesign --force --sign - "$APP"
 echo "Built $APP"
 

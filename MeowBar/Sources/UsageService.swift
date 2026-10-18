@@ -11,12 +11,28 @@ struct UsageWindow {
     var windowSeconds: TimeInterval? = nil
 }
 
+// What the user can do about an error state — rendered as a button under it.
+enum ProviderAction {
+    case renewClaude            // launch `claude` briefly so it self-renews
+    case runInTerminal(String)  // e.g. "codex login"
+    case openApp(String)        // e.g. "Devin" in /Applications
+
+    var title: String {
+        switch self {
+        case .renewClaude: return "Renew sign-in"
+        case .runInTerminal(let cmd): return "Run `\(cmd)` in Terminal"
+        case .openApp(let app): return "Open \(app)"
+        }
+    }
+}
+
 struct ProviderUsage {
     var name: String
     var session: UsageWindow? = nil
     var weekly: UsageWindow? = nil
     var error: String? = nil
-    var note: String? = nil       // plan label, e.g. "Pro"
+    var action: ProviderAction? = nil
+    var note: String? = nil       // plan label, e.g. "Pro" — shown alongside bars
     var noteAccent: String? = nil // emphasized word, e.g. "unlimited" (green)
     var fetchedAt: Date = Date()
     var hasData: Bool { session != nil || weekly != nil }
@@ -25,13 +41,20 @@ struct ProviderUsage {
 
 enum UsageError: LocalizedError {
     case noCredentials(String), http(Int, String), refreshFailed(String)
+    case actionable(String, ProviderAction?)
 
     var errorDescription: String? {
         switch self {
         case .noCredentials(let hint): return hint
         case .http(let code, let hint): return "HTTP \(code). \(hint)"
         case .refreshFailed(let hint): return hint
+        case .actionable(let hint, _): return hint
         }
+    }
+
+    var action: ProviderAction? {
+        if case .actionable(_, let a) = self { return a }
+        return nil
     }
 }
 
@@ -85,6 +108,34 @@ private func runProcess(_ launch: String, _ args: [String], timeout: TimeInterva
         return (-2, String(data: out, encoding: .utf8) ?? "")
     }
     return (p.terminationStatus, String(data: out, encoding: .utf8) ?? "")
+}
+
+// GUI apps inherit a minimal PATH, so `which` alone misses CLIs installed via
+// brew/npm/nvm/volta/asdf/mise/fnm. Search PATH plus the usual manager dirs
+// (including versioned subdirs for nvm/fnm/mise).
+private func cliPath(_ name: String) -> String? {
+    let home = NSHomeDirectory()
+    var dirs = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+        .split(separator: ":").map(String.init)
+    dirs += [
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+        home + "/.local/bin", home + "/.volta/bin", home + "/.npm-global/bin",
+        home + "/Library/pnpm", home + "/.yarn/bin",
+        home + "/.config/yarn/global/node_modules/.bin",
+        home + "/.asdf/shims", home + "/.local/share/mise/shims", home + "/bin",
+    ]
+    let fm = FileManager.default
+    for base in [home + "/.nvm/versions/node", home + "/.local/share/mise/installs/node",
+                 home + "/Library/Application Support/fnm/node-versions",
+                 home + "/.local/share/fnm/node-versions"] {
+        for v in (try? fm.contentsOfDirectory(atPath: base)) ?? [] {
+            dirs.append("\(base)/\(v)/bin")
+        }
+    }
+    for d in dirs where fm.isExecutableFile(atPath: d + "/" + name) {
+        return d + "/" + name
+    }
+    return nil
 }
 
 private let claudeService = "Claude Code-credentials"
@@ -169,12 +220,43 @@ private func refreshClaudeToken(_ cred: [String: Any], account: String) async th
     return updated
 }
 
+private func claudeExpiresAt(_ cred: [String: Any]) -> Double {
+    guard let oauth = cred["claudeAiOauth"] as? [String: Any] else { return 0 }
+    return (oauth["expiresAt"] as? Double) ?? (oauth["expiresAt"] as? Int).map(Double.init) ?? 0
+}
+
+// Claude Code renews its own OAuth token on startup, so when ours is expired
+// (and self-refresh failed) we probe `claude auth status` — and if that didn't
+// renew, boot the CLI headless for a few seconds with /exit piped in. Nothing
+// is sent to the API. Backed off so a signed-out user doesn't respawn it
+// every refresh cycle.
+private var claudeReviveBlockedUntil = Date.distantPast
+
+private func reviveClaudeToken() -> Bool {
+    guard Date() >= claudeReviveBlockedUntil, let bin = cliPath("claude") else { return false }
+    claudeReviveBlockedUntil = Date().addingTimeInterval(30 * 60)
+    _ = runProcess(bin, ["auth", "status", "--json"], timeout: 15)
+    if let (c, _) = try? loadClaudeCredentials(),
+       claudeExpiresAt(c) > Date().timeIntervalSince1970 * 1000 { return true }
+    _ = runProcess("/bin/sh", ["-c", "printf '/exit\\n' | \"\(bin)\""], timeout: 15)
+    if let (c, _) = try? loadClaudeCredentials(),
+       claudeExpiresAt(c) > Date().timeIntervalSince1970 * 1000 { return true }
+    return false
+}
+
 private func claudeAccessToken() async throws -> String {
     var (cred, account) = try loadClaudeCredentials()
     var oauth = cred["claudeAiOauth"] as! [String: Any]
-    let expiresAt = (oauth["expiresAt"] as? Double) ?? (oauth["expiresAt"] as? Int).map(Double.init) ?? 0
+    let expiresAt = claudeExpiresAt(cred)
     if expiresAt < Date().timeIntervalSince1970 * 1000 {
-        cred = try await refreshClaudeToken(cred, account: account)
+        do {
+            cred = try await refreshClaudeToken(cred, account: account)
+        } catch {
+            // Refresh token rejected too — let Claude Code renew itself.
+            if reviveClaudeToken(), let (fresh, acct) = try? loadClaudeCredentials() {
+                cred = fresh; account = acct
+            } else { throw error }
+        }
         oauth = cred["claudeAiOauth"] as! [String: Any]
     }
     guard let token = oauth["accessToken"] as? String else {
@@ -353,51 +435,204 @@ enum UsageService {
     private static var claudeCache: ProviderUsage? = nil
     private static var claudeBlockedUntil: Date = .distantPast
 
+    // `claude auth status --json` result: catches signed-out and metered
+    // (non-subscription) billing before the Keychain dance. nil method =
+    // unknown (CLI absent) — don't gate anything on it. A signed-out state is
+    // re-probed at most every 5 min so the error clears on its own after the
+    // user signs back in.
+    private static var claudeAuthMethod: String??
+    private static var claudeLoggedIn = true
+    private static var claudeProbeBlockedUntil = Date.distantPast
+
+    private static func claudePrecheck() throws {
+        if claudeAuthMethod == nil || (!claudeLoggedIn && Date() >= claudeProbeBlockedUntil) {
+            var method: String? = nil
+            if let bin = cliPath("claude") {
+                let (rc, out) = runProcess(bin, ["auth", "status", "--json"], timeout: 15)
+                if rc == 0, let st = jsonDict(Data(out.utf8)) as [String: Any]? {
+                    claudeLoggedIn = st["loggedIn"] as? Bool ?? true
+                    method = st["authMethod"] as? String
+                }
+            }
+            claudeAuthMethod = method
+            if !claudeLoggedIn { claudeProbeBlockedUntil = Date().addingTimeInterval(300) }
+        }
+        if !claudeLoggedIn {
+            throw UsageError.actionable(
+                "Claude Code isn't signed in", .runInTerminal("claude auth login"))
+        }
+        let metered = ["apiKey", "api", "console", "bedrock", "vertex"]
+        if let m = claudeAuthMethod ?? nil, metered.contains(m) {
+            throw UsageError.actionable(
+                "Claude Code is signed in with \(m) billing, which has no plan limits to show", nil)
+        }
+    }
+
     static func fetchClaude() async -> ProviderUsage {
         if let cached = claudeCache, Date() < claudeBlockedUntil { return cached }
         var u = ProviderUsage(name: "Claude")
+        // Bridge installed → Claude Code pushes fresh numbers on every render;
+        // no API polling at all (this is what kills the 429s). Snapshot wins.
+        if StatuslineBridge.isInstalled {
+            if let bridged = claudeFromSnapshot() { return bridged }
+            if StatuslineBridge.isBroken {
+                u.error = "Status line tracking points at a missing helper — toggle it off/on in Settings"
+                return u
+            }
+            // bridge on, nothing pushed yet → fall through to OAuth meanwhile
+        }
         do {
-            let token = try await claudeAccessToken()
-            let (status, data, hdrs) = try await httpRequest(
-                "https://api.anthropic.com/api/oauth/usage",
-                headers: ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20"])
-            let json = jsonDict(data)
-            if status == 429 {
-                let wait = Double(hdrs["retry-after"] ?? "") ?? 120
-                claudeBlockedUntil = Date().addingTimeInterval(wait)
-                if let cached = claudeCache { return cached }
-                throw UsageError.http(429, "rate-limited — retrying \(Notifier.countdown(to: claudeBlockedUntil))")
-            }
-            guard status == 200 else {
-                if status == 401 || status == 403 {
-                    throw UsageError.http(status, "Claude token rejected — run `claude` once to sign in again")
+            try claudePrecheck()
+            var token = try await claudeAccessToken()
+            var tried = 0
+            while true {
+                let (status, data, hdrs) = try await httpRequest(
+                    "https://api.anthropic.com/api/oauth/usage",
+                    headers: ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20"])
+                let json = jsonDict(data)
+                if status == 429 {
+                    let wait = Double(hdrs["retry-after"] ?? "") ?? 120
+                    claudeBlockedUntil = Date().addingTimeInterval(wait)
+                    if let cached = claudeCache { return cached }
+                    throw UsageError.http(429, "rate-limited — retrying \(Notifier.countdown(to: claudeBlockedUntil))")
                 }
-                throw UsageError.http(status, "Claude usage unavailable")
+                if (status == 401 || status == 403) && tried == 0 && reviveClaudeToken() {
+                    // Claude Code renewed itself — reload and retry once.
+                    tried += 1
+                    token = try await claudeAccessToken()
+                    continue
+                }
+                guard status == 200 else {
+                    if status == 401 || status == 403 {
+                        throw UsageError.http(status, "Claude session rejected — open `claude` once to sign in again")
+                    }
+                    throw UsageError.http(status, "Claude usage unavailable")
+                }
+                u.session = claudeWindow(json, keys: ["five_hour", "fiveHour", "session", "session_5h"], seconds: 18000)
+                u.weekly = claudeWindow(json, keys: ["seven_day", "sevenDay", "weekly", "week"], seconds: 604800)
+                claudeCache = u
+                break
             }
-            u.session = claudeWindow(json, keys: ["five_hour", "fiveHour", "session", "session_5h"], seconds: 18000)
-            u.weekly = claudeWindow(json, keys: ["seven_day", "sevenDay", "weekly", "week"], seconds: 604800)
-            claudeCache = u
-        } catch { u.error = error.localizedDescription }
+        } catch {
+            u.error = error.localizedDescription
+            u.action = (error as? UsageError)?.action
+            if u.action == nil, let ue = error as? UsageError {
+                switch ue {
+                case .refreshFailed, .noCredentials: u.action = .renewClaude
+                case .http(let code, _) where code == 401 || code == 403: u.action = .renewClaude
+                default: break
+                }
+            }
+        }
         return u
     }
 
     static func fetchCodex() async -> ProviderUsage {
-        var u = ProviderUsage(name: "Codex")
+        // Preferred path: `codex app-server` — the CLI's own JSON-RPC surface
+        // (read-only; nothing written to ~/.codex). Falls back to the
+        // wham/usage HTTP endpoint when the binary is missing or won't talk.
         do {
-            var auth = try loadCodexAuth()
-            var tokens = auth["tokens"] as! [String: Any]
-            var (status, data, _) = try await codexUsageRequest(tokens)
-            if status == 401 || status == 403 {
-                auth = try await refreshCodexToken(auth)
-                tokens = auth["tokens"] as! [String: Any]
-                (status, data, _) = try await codexUsageRequest(tokens)
+            return try await codexViaAppServer()
+        } catch {
+            var u = ProviderUsage(name: "Codex")
+            do {
+                var auth = try loadCodexAuth()
+                var tokens = auth["tokens"] as! [String: Any]
+                var (status, data, _) = try await codexUsageRequest(tokens)
+                if status == 401 || status == 403 {
+                    auth = try await refreshCodexToken(auth)
+                    tokens = auth["tokens"] as! [String: Any]
+                    (status, data, _) = try await codexUsageRequest(tokens)
+                }
+                guard status == 200 else { throw UsageError.http(status, "Codex usage unavailable") }
+                let rl = jsonDict(data)["rate_limit"] as? [String: Any] ?? [:]
+                u.session = codexWindow(rl["primary_window"])
+                u.weekly = codexWindow(rl["secondary_window"])
+            } catch let inner as UsageError {
+                if cliPath("codex") == nil, inner.localizedDescription.contains("No Codex credentials") {
+                    u.error = "Codex isn't installed on this Mac"
+                    u.action = .runInTerminal("npm install -g @openai/codex")
+                } else {
+                    u.error = inner.localizedDescription
+                    u.action = inner.action ?? codexAction(for: inner)
+                }
+            } catch { u.error = error.localizedDescription }
+            return u
+        }
+    }
+
+    // app-server returns richer data than the HTTP endpoint: auth method
+    // (chatgpt vs api-key), planType, per-limit maps, credit info.
+    private static func codexViaAppServer() async throws -> ProviderUsage {
+        guard let bin = cliPath("codex") else {
+            throw UsageError.noCredentials("Codex isn't installed on this Mac")
+        }
+        let rpc = try await Task.detached(priority: .utility) { () throws -> [Int: [String: Any]] in
+            try CodexRPC.run(binary: bin)
+        }.value
+        var u = ProviderUsage(name: "Codex")
+        if let errMsg = (rpc[2]?["error"] as? [String: Any])?["message"] as? String
+            ?? (rpc[3]?["error"] as? [String: Any])?["message"] as? String {
+            let lower = errMsg.lowercased()
+            if lower.contains("not signed in") || lower.contains("not logged in")
+                || lower.contains("authentication required") || lower.contains("unauthorized") {
+                u.error = "Codex is installed but not signed in"
+                u.action = .runInTerminal("codex login")
+                u.fetchedAt = Date()
+                return u
             }
-            guard status == 200 else { throw UsageError.http(status, "Codex usage unavailable") }
-            let rl = jsonDict(data)["rate_limit"] as? [String: Any] ?? [:]
-            u.session = codexWindow(rl["primary_window"])
-            u.weekly = codexWindow(rl["secondary_window"])
-        } catch { u.error = error.localizedDescription }
+            throw UsageError.actionable(errMsg, nil)
+        }
+        guard let acctRes = rpc[2]?["result"] as? [String: Any],
+              let rlRes = rpc[3]?["result"] as? [String: Any] else {
+            throw UsageError.actionable("Codex didn't answer — retrying", nil)
+        }
+        if let account = acctRes["account"] as? [String: Any],
+           (account["type"] as? String) == "apiKey" {
+            u.error = "Codex is signed in with an API key, which has no plan limits — sign in with ChatGPT to see them"
+            u.action = .runInTerminal("codex login")
+            return u
+        }
+        if acctRes["account"] == nil || (acctRes["account"] as? [String: Any]) == nil {
+            // Signed out: account/read answers with no account object.
+            if let requires = acctRes["requiresOpenaiAuth"] as? Bool, requires {
+                u.error = "Codex is installed but not signed in"
+                u.action = .runInTerminal("codex login")
+                return u
+            }
+        }
+        let rl = rlRes["rateLimits"] as? [String: Any] ?? [:]
+        u.session = appServerWindow(rl["primary"])
+        u.weekly = appServerWindow(rl["secondary"])
+        let credits = rl["credits"] as? [String: Any] ?? [:]
+        if credits["unlimited"] as? Bool == true {
+            u.note = (rl["planType"] as? String)?.capitalized ?? "Plan"
+            u.noteAccent = "unlimited"
+        } else if let plan = rl["planType"] as? String, !plan.isEmpty {
+            u.note = plan.capitalized
+        }
+        if !u.hasData { u.error = "Codex hasn't reported any limits yet — they appear after you first use Codex" }
         return u
+    }
+
+    private static func codexAction(for e: UsageError) -> ProviderAction? {
+        switch e {
+        case .noCredentials, .refreshFailed: return .runInTerminal("codex login")
+        case .http, .actionable: return nil
+        }
+    }
+
+    private static func appServerWindow(_ any: Any?) -> UsageWindow? {
+        guard let w = any as? [String: Any] else { return nil }
+        var win = UsageWindow()
+        win.usedPercent = (w["usedPercent"] as? Double) ?? (w["usedPercent"] as? Int).map(Double.init) ?? 0
+        if let mins = (w["windowDurationMins"] as? Double) ?? (w["windowDurationMins"] as? Int).map(Double.init) {
+            win.windowSeconds = mins * 60
+        }
+        if let ts = (w["resetsAt"] as? Double) ?? (w["resetsAt"] as? Int).map(Double.init) {
+            win.resetsAt = Date(timeIntervalSince1970: ts)
+        }
+        return win
     }
 
     private static func codexUsageRequest(_ tokens: [String: Any]) async throws -> (Int, Data, [String: String]) {
@@ -482,7 +717,32 @@ enum UsageService {
             if let cached = devinCache { return cached }
             var u = ProviderUsage(name: "Devin")
             u.error = error.localizedDescription
+            u.action = (error as? UsageError)?.action
+            if u.action == nil, case .http(let code, _) = error as? UsageError,
+               code == 401 || code == 403 {
+                u.action = .openApp("Devin")
+            }
             return u
+        }
+    }
+
+    // Popover action buttons. renewClaude bypasses the revive backoff (it's
+    // user-triggered); runInTerminal opens Terminal with the command visible.
+    static func perform(_ action: ProviderAction) {
+        switch action {
+        case .renewClaude:
+            claudeReviveBlockedUntil = .distantPast
+            _ = reviveClaudeToken()
+        case .runInTerminal(let cmd):
+            let safe = cmd.replacingOccurrences(of: "\"", with: "\\\"")
+            let src = """
+                tell application "Terminal" to activate
+                tell application "Terminal" to do script "\(safe)"
+                """
+            var err: NSDictionary?
+            NSAppleScript(source: src)?.executeAndReturnError(&err)
+        case .openApp(let name):
+            _ = runProcess("/usr/bin/open", ["-a", name])
         }
     }
 
@@ -494,6 +754,44 @@ enum UsageService {
         if let d = f.date(from: s) { return d }
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: s)
+    }
+
+    // Statusline snapshot → ProviderUsage. nil = nothing usable pushed yet
+    // (Claude Code hasn't rendered since install, or no rate_limits yet).
+    private static func claudeFromSnapshot() -> ProviderUsage? {
+        guard let snap = StatuslineBridge.snapshot(),
+              let windows = snap["windows"] as? [String: Any] else { return nil }
+        var u = ProviderUsage(name: "Claude")
+        u.session = snapshotWindow(windows["five_hour"], seconds: 18000)
+        u.weekly = snapshotWindow(windows["seven_day"], seconds: 604800)
+        guard u.hasData else { return nil }
+        if let ts = snap["observed_at"] as? Double {
+            u.fetchedAt = Date(timeIntervalSince1970: ts)
+        }
+        // Stale checks → fall back to the API:
+        //  • a reset boundary already crossed (data predates a rollover)
+        //  • snapshot older than 6h — if the statusline isn't rendering (e.g.
+        //    Claude only ever used via an IDE), the bridge must not pin stale
+        //    numbers forever
+        let now = Date()
+        if let ts = snap["observed_at"] as? Double,
+           now.timeIntervalSince1970 - ts > 6 * 3600 { return nil }
+        for w in [u.session, u.weekly].compactMap({ $0 }) {
+            if let r = w.resetsAt, r < now { return nil }
+        }
+        return u
+    }
+
+    private static func snapshotWindow(_ any: Any?, seconds: TimeInterval) -> UsageWindow? {
+        guard let w = any as? [String: Any] else { return nil }
+        var win = UsageWindow(windowSeconds: seconds)
+        win.usedPercent = (w["used_percentage"] as? Double)
+            ?? (w["used_percentage"] as? Int).map(Double.init) ?? 0
+        if let s = w["resets_at"] as? String { win.resetsAt = parseISO8601(s) }
+        else if let ts = w["resets_at"] as? Double {
+            win.resetsAt = Date(timeIntervalSince1970: ts > 1e12 ? ts / 1000 : ts)
+        }
+        return win
     }
 
     private static func claudeWindow(_ json: [String: Any], keys: [String], seconds: TimeInterval) -> UsageWindow? {
@@ -537,16 +835,23 @@ enum Notifier {
     }
 
     static func evaluate(_ u: ProviderUsage) {
+        let d = UserDefaults.standard
+        // First launch: defaults register as true
+        let on = { d.object(forKey: $0) == nil ? true : d.bool(forKey: $0) }
         for (label, w) in [("session", u.session), ("weekly", u.weekly)] {
             guard let w else { continue }
             let key = "\(u.name) \(label)"
             if let reset = w.resetsAt {
-                if let prev = lastReset[key], reset > prev.addingTimeInterval(60) {
+                if on("meowbar.alertReset"), let prev = lastReset[key],
+                   reset > prev.addingTimeInterval(60) {
                     notify("\(u.name) \(label) limit reset", body: "Fresh window started.")
                 }
                 lastReset[key] = reset
             }
-            let level = w.usedPercent >= 95 ? 95 : w.usedPercent >= 90 ? 90 : w.usedPercent >= 75 ? 75 : 0
+            var level = 0
+            if on("meowbar.alert95"), w.usedPercent >= 95 { level = 95 }
+            else if on("meowbar.alert90"), w.usedPercent >= 90 { level = 90 }
+            else if on("meowbar.alert75"), w.usedPercent >= 75 { level = 75 }
             let prev = lastLevel[key] ?? 0
             if level > prev {
                 notify("\(u.name) \(label): \(Int(w.usedPercent))% used",
@@ -570,5 +875,163 @@ enum Notifier {
         if d > 0 { return "in \(d)d \(h)h" }
         if h > 0 { return "in \(h)h \(m)m" }
         return "in \(m)m"
+    }
+}
+
+// MARK: - Claude statusline bridge
+//
+// Optionally installs `meowbar-statusline` as Claude Code's statusLine
+// command. Claude Code then PUSHES fresh rate_limits on every render — no
+// polling, no 429s, always current. The helper chains to the user's original
+// statusline so their prompt is unchanged. Everything reversible: the prior
+// settings.json is backed up and the original statusLine command is stored
+// for chaining + restore.
+
+enum StatuslineBridge {
+    static let supportDir = NSHomeDirectory() + "/Library/Application Support/MeowBar"
+    static let helperPath = supportDir + "/meowbar-statusline"
+    static let snapshotPath = supportDir + "/claude-statusline.json"
+    static let originalPath = supportDir + "/original-statusline.json"
+    static let backupPath = supportDir + "/settings-backup.json"
+    static let claudeSettingsPath = NSHomeDirectory() + "/.claude/settings.json"
+
+    static var isInstalled: Bool {
+        guard let data = FileManager.default.contents(atPath: claudeSettingsPath),
+              let s = jsonDict(data) as [String: Any]?,
+              let sl = s["statusLine"] as? [String: Any],
+              let cmd = sl["command"] as? String else { return false }
+        return cmd == helperPath
+    }
+
+    // Status a coworker can act on: installed vs broken (settings points at a
+    // missing helper — e.g. app moved/deleted while enabled).
+    static var isBroken: Bool {
+        guard let data = FileManager.default.contents(atPath: claudeSettingsPath),
+              let s = jsonDict(data) as [String: Any]?,
+              let sl = s["statusLine"] as? [String: Any],
+              let cmd = sl["command"] as? String,
+              cmd == helperPath else { return false }
+        return !FileManager.default.isExecutableFile(atPath: helperPath)
+    }
+
+    static func install() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: supportDir, withIntermediateDirectories: true)
+
+        // 1. helper binary: copy out of the app bundle to a stable path
+        guard let bundled = Bundle.main.path(forAuxiliaryExecutable: "meowbar-statusline")
+                ?? Bundle.main.path(forResource: "meowbar-statusline", ofType: nil) else {
+            throw UsageError.actionable("Bridge helper missing from the app bundle — rebuild MeowBar", nil)
+        }
+        try? fm.removeItem(atPath: helperPath)
+        try fm.copyItem(atPath: bundled, toPath: helperPath)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperPath)
+
+        // 2. settings.json
+        guard let data = fm.contents(atPath: claudeSettingsPath),
+              var settings = jsonDict(data) as [String: Any]? else {
+            throw UsageError.actionable("Can't read Claude Code's settings.json", nil)
+        }
+        // timestamped backup — restored on uninstall if needed
+        try? fm.copyItem(atPath: claudeSettingsPath, toPath: backupPath)
+
+        // 3. preserve any existing statusLine as the chain target (unless it's
+        //    already ours)
+        if let sl = settings["statusLine"] as? [String: Any],
+           let cmd = sl["command"] as? String, cmd != helperPath, !cmd.isEmpty {
+            let orig: [String: Any] = ["command": cmd]
+            if let d = try? JSONSerialization.data(withJSONObject: orig) {
+                try? d.write(to: URL(fileURLWithPath: originalPath))
+            }
+        } else {
+            try? fm.removeItem(atPath: originalPath)
+        }
+
+        // 4. install ours
+        settings["statusLine"] = ["type": "command", "command": helperPath]
+        let out = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted])
+        try out.write(to: URL(fileURLWithPath: claudeSettingsPath), options: .atomic)
+    }
+
+    static func uninstall() throws {
+        let fm = FileManager.default
+        guard let data = fm.contents(atPath: claudeSettingsPath),
+              var settings = jsonDict(data) as [String: Any]? else { return }
+        // Only touch statusLine if it's ours — never clobber someone else's.
+        if let sl = settings["statusLine"] as? [String: Any],
+           let cmd = sl["command"] as? String, cmd == helperPath {
+            if let od = fm.contents(atPath: originalPath),
+               let orig = jsonDict(od) as [String: Any]?,
+               let cmd = orig["command"] as? String {
+                settings["statusLine"] = ["type": "command", "command": cmd]
+            } else {
+                settings.removeValue(forKey: "statusLine")
+            }
+            if let out = try? JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted]) {
+                try? out.write(to: URL(fileURLWithPath: claudeSettingsPath), options: .atomic)
+            }
+        }
+        try? fm.removeItem(atPath: originalPath)
+    }
+
+    // Latest pushed snapshot, if the bridge produced one.
+    static func snapshot() -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: snapshotPath) else { return nil }
+        return jsonDict(data)
+    }
+}
+
+// MARK: - codex app-server (JSON-RPC over stdio)
+
+private enum CodexRPC {
+    // One-shot session: initialize → initialized → account/read +
+    // account/rateLimits/read, then terminate. Read-only; never touches
+    // ~/.codex. Server notifications (remoteControl/status etc.) are ignored.
+    static func run(binary: String) throws -> [Int: [String: Any]] {
+        let p = Process(), inPipe = Pipe(), outPipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: binary)
+        p.arguments = ["app-server"]
+        p.standardInput = inPipe
+        p.standardOutput = outPipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch {
+            throw UsageError.noCredentials("Couldn't start Codex: \(error.localizedDescription)")
+        }
+        // Watchdog: a stuck server must never block a refresh cycle.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) { p.terminate() }
+        defer { p.terminate() }
+
+        let stdin = inPipe.fileHandleForWriting
+        func send(_ msg: [String: Any]) {
+            guard let d = try? JSONSerialization.data(withJSONObject: msg) else { return }
+            stdin.write(d)
+            stdin.write("\n".data(using: .utf8)!)
+        }
+        send(["jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": ["clientInfo": ["name": "meowbar", "version": "1.0"]]])
+
+        var responses: [Int: [String: Any]] = [:]
+        var buf = Data(), requested = false
+        let reader = outPipe.fileHandleForReading
+        while !responses.keys.contains(3) {
+            let chunk = reader.availableData // blocks until data or EOF (watchdog)
+            if chunk.isEmpty { break }
+            buf += chunk
+            while let nl = buf.firstIndex(of: 0x0A) {
+                let line = Data(buf[..<nl]); buf = Data(buf[buf.index(after: nl)...])
+                guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                if let id = j["id"] as? Int { responses[id] = j }
+                if !requested, responses[1] != nil {
+                    requested = true
+                    send(["jsonrpc": "2.0", "method": "initialized", "params": [String: Any]()])
+                    send(["jsonrpc": "2.0", "id": 2, "method": "account/read", "params": [String: Any]()])
+                    send(["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [String: Any]()])
+                }
+            }
+        }
+        guard responses[2] != nil, responses[3] != nil else {
+            throw UsageError.http(0, "Codex didn't answer")
+        }
+        return responses
     }
 }
