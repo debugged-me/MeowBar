@@ -34,26 +34,29 @@ final class UsageStore: ObservableObject {
     // "<claude-glyph> <pct>%   <codex-glyph> <pct>%" — each provider's worst
     // window (5h or 7d), severity-tinted. 🐱 alone until first data arrives.
     var menuTitle: NSAttributedString {
-        func entry(_ symbol: String, _ pct: Double?) -> NSAttributedString {
+        // <claude logo> <pct>%   <codex blossom> <pct>% — session window each,
+        // severity-tinted. Glyphs are template images so they track the menu bar.
+        func entry(_ resource: String, _ pct: Double?) -> NSAttributedString {
             let color: NSColor = pct == nil ? .secondaryLabelColor
                 : pct! >= 90 ? .systemRed : pct! >= 75 ? .systemOrange : .labelColor
-            guard var img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else {
-                return NSAttributedString()
+            let s = NSMutableAttributedString()
+            if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
+               let img = NSImage(contentsOf: url) {
+                img.isTemplate = true
+                img.size = NSSize(width: 13, height: 13)
+                let att = NSTextAttachment()
+                att.image = img
+                att.bounds = CGRect(x: 0, y: -2.5, width: 13, height: 13)
+                s.append(NSAttributedString(attachment: att))
             }
-            img = img.withSymbolConfiguration(.init(pointSize: 12, weight: .medium)) ?? img
-            img = img.withSymbolConfiguration(.init(paletteColors: [color])) ?? img
-            let att = NSTextAttachment()
-            att.image = img
-            att.bounds = CGRect(x: 0, y: -2, width: img.size.width, height: img.size.height)
-            let s = NSMutableAttributedString(attachment: att)
             s.append(NSAttributedString(string: pct.map { String(format: " %.0f%%", $0) } ?? " –",
                                         attributes: [.foregroundColor: color]))
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("staroflife.fill", claude.session?.usedPercent))
+        t.append(entry("claude", claude.session?.usedPercent))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("camera.aperture", codex.session?.usedPercent))
+        t.append(entry("codex", codex.session?.usedPercent))
         return t
     }
 
