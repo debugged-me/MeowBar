@@ -5,7 +5,13 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("🐱 MeowBar").font(.headline)
+            HStack(spacing: 6) {
+                if let icon = Bundle.main.image(forResource: "icon") {
+                    Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
+                        .frame(width: 18, height: 18)
+                }
+                Text("MeowBar").font(.headline)
+            }
             ProviderBlock(usage: store.claude)
             Divider()
             ProviderBlock(usage: store.codex)
