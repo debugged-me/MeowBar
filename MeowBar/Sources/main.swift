@@ -18,15 +18,43 @@ final class UsageStore: ObservableObject {
     private var prevRunning: [String: Bool] = [:]
     private var prevWorst: [String: Double] = [:]
     private let alertTTL: TimeInterval = 60
+    private var demoActive = false
 
     func start() {
+        if injectDemo() { return }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
 
+    // Sample data for screenshots/demos — only active when launched with
+    // MEOWBAR_DEMO=normal or MEOWBAR_DEMO=alerts in the environment.
+    private func injectDemo() -> Bool {
+        guard let mode = ProcessInfo.processInfo.environment["MEOWBAR_DEMO"] else { return false }
+        let now = Date()
+        func win(_ used: Double, _ inSecs: TimeInterval, _ span: TimeInterval) -> UsageWindow {
+            UsageWindow(usedPercent: used, resetsAt: now + inSecs, windowSeconds: span)
+        }
+        claude.session = win(58, 3.2 * 3600, 18000)
+        claude.weekly = win(29, 4.4 * 86400, 604800)
+        codex.session = win(14, 2.1 * 3600, 18000)
+        codex.weekly = win(45, 5.2 * 86400, 604800)
+        devin.note = "Pro"; devin.noteAccent = "unlimited"
+        if mode == "alerts" {
+            claude.session = win(96, 0.8 * 3600, 18000)
+            claude.weekly = win(100, 3.7 * 86400, 604800)
+            codexRunning = true
+            arm("Claude", "limit reached", now: now)
+        }
+        lastUpdated = now
+        demoActive = true
+        onUpdate?()
+        return true
+    }
+
     func refresh() {
+        if demoActive { return }
         Task {
             async let c = UsageService.fetchClaude()
             async let x = UsageService.fetchCodex()
