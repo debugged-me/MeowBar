@@ -98,7 +98,7 @@ final class UsageStore: ObservableObject {
             let s = NSMutableAttributedString()
             if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
                let img = NSImage(contentsOf: url) {
-                img.isTemplate = true
+                img.isTemplate = false // keep brand colors; template only tinted on click
                 img.size = NSSize(width: 16, height: 16)
                 let att = NSTextAttachment()
                 att.image = img
@@ -106,16 +106,19 @@ final class UsageStore: ObservableObject {
                 s.append(NSAttributedString(attachment: att))
             }
             let label: String
+            var attrs: [NSAttributedString.Key: Any] = [.foregroundColor: color]
             if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
                 label = " " + alert
-                color = alert == "task done" ? .systemGreen : .systemRed
+                attrs[.foregroundColor] = alert == "task done" ? NSColor.systemGreen : NSColor.systemRed
+                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             } else if running {
                 label = " running"
-                color = .systemGreen
+                attrs[.foregroundColor] = NSColor.systemGreen
+                attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             } else {
                 label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
             }
-            s.append(NSAttributedString(string: label, attributes: [.foregroundColor: color]))
+            s.append(NSAttributedString(string: label, attributes: attrs))
             return s
         }
         let t = NSMutableAttributedString()
@@ -165,8 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Notifier.requestPermission()
 
         // .transient is unreliable for accessory apps — explicitly close on
-        // any click delivered to another app while the popover is up.
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+        // any outside click or keypress while the popover is up.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] _ in
             self?.popover.performClose(nil)
         }
     }

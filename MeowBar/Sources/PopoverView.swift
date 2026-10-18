@@ -15,7 +15,7 @@ struct PopoverView: View {
             ProviderBlock(usage: store.claude, running: store.claudeRunning)
             Divider()
             ProviderBlock(usage: store.codex, running: store.codexRunning)
-            if store.devin.hasData {
+            if store.devin.isVisible {
                 Divider()
                 ProviderBlock(usage: store.devin, running: store.devinRunning)
             }
@@ -36,7 +36,7 @@ struct ProviderBlock: View {
     let usage: ProviderUsage
     var running: Bool = false
 
-    private var titleColor: Color {
+    private var brandColor: Color {
         switch usage.name {
         case "Claude": return Color(red: 0.85, green: 0.47, blue: 0.34) // anthropic coral
         case "Codex": return Color(red: 0.06, green: 0.64, blue: 0.50)  // openai green
@@ -47,7 +47,7 @@ struct ProviderBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 5) {
-                Text(usage.name).font(.subheadline).bold().foregroundStyle(titleColor)
+                Text(usage.name).font(.subheadline).bold().foregroundStyle(brandColor)
                 if running {
                     Text("running").font(.caption2).foregroundStyle(.green)
                 }
@@ -56,12 +56,20 @@ struct ProviderBlock: View {
                 Text(err).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             // Skip "—" placeholders when the error already explains missing data
-            let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
-            if usage.session != nil || usage.error == nil {
-                WindowRow(title: sessionLabel, w: usage.session)
-            }
-            if usage.weekly != nil || usage.error == nil {
-                WindowRow(title: "Weekly · 7d", w: usage.weekly)
+            if usage.note != nil || usage.noteAccent != nil {
+                HStack(spacing: 4) {
+                    if let note = usage.note { Text(note).foregroundStyle(.secondary) }
+                    if let accent = usage.noteAccent { Text(accent).foregroundStyle(.green) }
+                }
+                .font(.caption)
+            } else {
+                let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
+                if usage.session != nil || usage.error == nil {
+                    WindowRow(title: sessionLabel, w: usage.session, tint: brandColor)
+                }
+                if usage.weekly != nil || usage.error == nil {
+                    WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
+                }
             }
         }
     }
@@ -70,6 +78,7 @@ struct ProviderBlock: View {
 struct WindowRow: View {
     let title: String
     let w: UsageWindow?
+    var tint: Color = .accentColor
 
     private static let timeFmt: Date.FormatStyle = .dateTime.hour().minute()
     private static let dayFmt: Date.FormatStyle = .dateTime.weekday(.abbreviated).hour().minute()
@@ -101,8 +110,8 @@ struct WindowRow: View {
     }
 
     private var barColor: Color {
-        guard let w else { return .accentColor }
-        return w.usedPercent >= 90 ? .red : w.usedPercent >= 75 ? .orange : .accentColor
+        guard let w else { return tint }
+        return w.usedPercent >= 90 ? .red : w.usedPercent >= 75 ? .orange : tint
     }
 
     private var resetText: String {

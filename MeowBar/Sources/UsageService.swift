@@ -16,8 +16,11 @@ struct ProviderUsage {
     var session: UsageWindow? = nil
     var weekly: UsageWindow? = nil
     var error: String? = nil
+    var note: String? = nil       // plan label, e.g. "Pro"
+    var noteAccent: String? = nil // emphasized word, e.g. "unlimited" (green)
     var fetchedAt: Date = Date()
     var hasData: Bool { session != nil || weekly != nil }
+    var isVisible: Bool { hasData || note != nil || noteAccent != nil }
 }
 
 enum UsageError: LocalizedError {
@@ -448,19 +451,29 @@ enum UsageService {
                 throw UsageError.http(status, "Devin usage unavailable")
             }
             var u = ProviderUsage(name: "Devin")
-            func quota(_ remKey: String, _ resetKey: String, _ secs: TimeInterval) -> UsageWindow? {
-                guard let rem = plan[remKey] as? Double ?? (plan[remKey] as? Int).map(Double.init)
-                        ?? (plan[remKey] as? String).flatMap(Double.init) else { return nil }
-                var w = UsageWindow(usedPercent: max(0, 100 - rem), windowSeconds: secs)
-                if let ts = plan[resetKey] as? Double ?? (plan[resetKey] as? String).flatMap(Double.init) {
-                    w.resetsAt = Date(timeIntervalSince1970: ts)
+            let planInfo = plan["planInfo"] as? [String: Any] ?? [:]
+            let planName = planInfo["planName"] as? String
+            // -1 = unmetered plan (Devin Pro reports quota pinned at 100 always).
+            let monthly = (planInfo["monthlyPromptCredits"] as? Int)
+                ?? (planInfo["monthlyPromptCredits"] as? String).flatMap(Int.init)
+            if monthly == -1 {
+                u.note = planName ?? "Plan"
+                u.noteAccent = "unlimited"
+            } else {
+                func quota(_ remKey: String, _ resetKey: String, _ secs: TimeInterval) -> UsageWindow? {
+                    guard let rem = plan[remKey] as? Double ?? (plan[remKey] as? Int).map(Double.init)
+                            ?? (plan[remKey] as? String).flatMap(Double.init) else { return nil }
+                    var w = UsageWindow(usedPercent: max(0, 100 - rem), windowSeconds: secs)
+                    if let ts = plan[resetKey] as? Double ?? (plan[resetKey] as? String).flatMap(Double.init) {
+                        w.resetsAt = Date(timeIntervalSince1970: ts)
+                    }
+                    return w
                 }
-                return w
+                u.session = quota("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", 86400)
+                u.weekly = quota("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", 604800)
+                if !u.hasData { u.error = "Devin: this plan reports no quota data" }
             }
-            u.session = quota("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", 86400)
-            u.weekly = quota("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", 604800)
-            if !u.hasData { u.error = "Devin: this plan reports no quota data" }
-            if u.hasData { devinCache = u }
+            if u.isVisible { devinCache = u }
             return devinCache ?? u
         } catch {
             if case UsageError.noCredentials = error {
