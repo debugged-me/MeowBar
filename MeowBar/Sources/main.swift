@@ -4,9 +4,18 @@ import SwiftUI
 final class UsageStore: ObservableObject {
     @Published var claude = ProviderUsage(name: "Claude")
     @Published var codex = ProviderUsage(name: "Codex")
+    @Published var claudeRunning = false
+    @Published var codexRunning = false
     @Published var lastUpdated: Date?
     var onUpdate: (() -> Void)?
     private var timer: Timer?
+    // Transient menu-bar alerts: armed on state edges (task finished, limit
+    // reached), auto-clear after alertTTL or instantly on click.
+    private var alertText: [String: String] = [:]
+    private var alertUntil: [String: Date] = [:]
+    private var prevRunning: [String: Bool] = [:]
+    private var prevWorst: [String: Double] = [:]
+    private let alertTTL: TimeInterval = 120
 
     func start() {
         refresh()
@@ -20,10 +29,28 @@ final class UsageStore: ObservableObject {
             async let c = UsageService.fetchClaude()
             async let x = UsageService.fetchCodex()
             let (cl, co) = await (c, x)
+            let (cRun, xRun) = UsageService.activeCLIs()
             await MainActor.run {
                 self.claude = cl
                 self.codex = co
+                self.claudeRunning = cRun
+                self.codexRunning = xRun
                 self.lastUpdated = Date()
+                let now = Date()
+                for s in [(name: "Claude", pct: Self.dispLeft(cl), worst: Self.worstUsed(cl), running: cRun),
+                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co), running: xRun)] {
+                    let wasRunning = self.prevRunning[s.name] ?? false
+                    let prevW = self.prevWorst[s.name] ?? -1
+                    self.prevRunning[s.name] = s.running
+                    if let w = s.worst { self.prevWorst[s.name] = w }
+                    if wasRunning && !s.running {
+                        self.arm(s.name, "task done", now: now)
+                    } else if let w = s.worst, w >= 90, prevW < 90 {
+                        self.arm(s.name, (s.pct ?? 0) <= 0 ? "limit reached" : "nearing limit", now: now)
+                    } else if (s.pct ?? 1) <= 0, self.alertText[s.name] == "nearing limit" {
+                        self.arm(s.name, "limit reached", now: now)
+                    }
+                }
                 Notifier.evaluate(cl)
                 Notifier.evaluate(co)
                 self.onUpdate?()
@@ -31,14 +58,35 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    // "<claude-glyph> <pct>%   <codex-glyph> <pct>%" — each provider's worst
-    // window (5h or 7d), severity-tinted. 🐱 alone until first data arrives.
+    static func worstUsed(_ u: ProviderUsage) -> Double? {
+        [u.session, u.weekly].compactMap { $0 }.map(\.usedPercent).max()
+    }
+
+    // Menu-bar number: weekly % left only when the weekly itself is the blocker
+    // (≥90% used); otherwise the session % left.
+    static func dispLeft(_ u: ProviderUsage) -> Double? {
+        let s = u.session?.usedPercent, w = u.weekly?.usedPercent
+        if let w, w >= 90 { return 100 - w }
+        return (s ?? w).map { 100 - $0 }
+    }
+
+    private func arm(_ name: String, _ text: String, now: Date) {
+        alertText[name] = text
+        alertUntil[name] = now.addingTimeInterval(alertTTL)
+    }
+
+    // Click = "seen it": clear all live alerts immediately.
+    func acknowledgeAlerts() {
+        alertText.removeAll()
+        alertUntil.removeAll()
+        onUpdate?()
+    }
+
     var menuTitle: NSAttributedString {
-        // <claude logo> <session>%   <codex blossom> <session>% — number is the
-        // session window; color follows the WORST window so a maxed weekly
-        // (provider unusable) shows red even when the session reads 0%.
-        func entry(_ resource: String, _ pct: Double?, _ sev: Double?) -> NSAttributedString {
-            let color: NSColor = sev == nil ? .secondaryLabelColor
+        // <logo> <state>: live alert word (armed on edges, expires after
+        // alertTTL or on click) > "running" while the CLI is busy > % left.
+        func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?, _ running: Bool) -> NSAttributedString {
+            var color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
@@ -50,25 +98,23 @@ final class UsageStore: ObservableObject {
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }
-            s.append(NSAttributedString(string: pct.map { String(format: " %.0f%%", $0) } ?? " –",
-                                        attributes: [.foregroundColor: color]))
+            let label: String
+            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
+                label = " " + alert
+                color = alert == "task done" ? .systemGreen : .systemRed
+            } else if running {
+                label = " running"
+                color = .systemGreen
+            } else {
+                label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
+            }
+            s.append(NSAttributedString(string: label, attributes: [.foregroundColor: color]))
             return s
         }
         let t = NSMutableAttributedString()
-        // Number = session % left, unless the weekly is nearly exhausted
-        // (≥90% used → it blocks you regardless) — then show weekly % left.
-        // Color = worst % used across both windows.
-        func disp(_ u: ProviderUsage) -> Double? {
-            let s = u.session?.usedPercent, w = u.weekly?.usedPercent
-            if let w, w >= 90 { return 100 - w }
-            return (s ?? w).map { 100 - $0 }
-        }
-        func worstUsed(_ u: ProviderUsage) -> Double? {
-            [u.session, u.weekly].compactMap { $0 }.map(\.usedPercent).max()
-        }
-        t.append(entry("claude", disp(claude), worstUsed(claude)))
+        t.append(entry("claude", "Claude", Self.dispLeft(claude), Self.worstUsed(claude), claudeRunning))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", disp(codex), worstUsed(codex)))
+        t.append(entry("codex", "Codex", Self.dispLeft(codex), Self.worstUsed(codex), codexRunning))
         return t
     }
 
@@ -122,6 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            store.acknowledgeAlerts()
             store.refresh()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }

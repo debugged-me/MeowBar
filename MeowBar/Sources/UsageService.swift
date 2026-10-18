@@ -236,6 +236,23 @@ private func jwtAudience(_ jwt: String) -> String? {
 
 enum UsageService {
 
+    // True when the claude/codex CLI process exists and is burning CPU
+    // (an idle REPL sits ~0%); heuristic for "a task is actually running".
+    static func activeCLIs() -> (claude: Bool, codex: Bool) {
+        let (_, out) = runProcess("/bin/ps", ["-A", "-o", "%cpu=", "-o", "comm="])
+        var c = false, x = false
+        for line in out.split(separator: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 2, let cpu = Double(parts[0]), cpu > 1.5 else { continue }
+            switch URL(fileURLWithPath: String(parts[1])).lastPathComponent.lowercased() {
+            case "claude": c = true
+            case "codex": x = true
+            default: break
+            }
+        }
+        return (c, x)
+    }
+
     // /api/oauth/usage is aggressively rate-limited (429 + Retry-After).
     // Keep last-good data and back off instead of blanking the UI.
     private static var claudeCache: ProviderUsage? = nil
