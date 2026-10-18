@@ -5,10 +5,10 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 if let icon = Bundle.main.image(forResource: "icon") {
                     Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 18, height: 18)
+                        .frame(width: 26, height: 26)
                 }
                 Text("MeowBar").font(.headline)
             }
