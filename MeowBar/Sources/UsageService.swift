@@ -17,6 +17,7 @@ struct ProviderUsage {
     var weekly: UsageWindow? = nil
     var error: String? = nil
     var fetchedAt: Date = Date()
+    var hasData: Bool { session != nil || weekly != nil }
 }
 
 enum UsageError: LocalizedError {
@@ -408,10 +409,26 @@ enum UsageService {
 
     // Devin quota: daily + weekly "remaining %" from GetUserStatus (Connect-RPC
     // JSON). The IDE's stored session token authenticates via metadata.api_key.
+    // Caches the decrypted credential + last-good usage so transient failures
+    // don't flicker the UI, and so decryption isn't repeated every poll.
+    private static var devinCredCache: DevinCredential? = nil
+    private static var devinCache: ProviderUsage? = nil
+    // Credential failures (missing storage, denied Keychain prompt) must not
+    // retrigger a `security` dialog every 30s — back off for 30 min.
+    private static var devinCredBlockedUntil: Date = .distantPast
+
     static func fetchDevin() async -> ProviderUsage {
-        var u = ProviderUsage(name: "Devin")
         do {
-            let cred = try loadDevinCredential()
+            let cred: DevinCredential
+            if let cached = devinCredCache {
+                cred = cached
+            } else {
+                if Date() < devinCredBlockedUntil {
+                    return devinCache ?? ProviderUsage(name: "Devin")
+                }
+                cred = try loadDevinCredential()
+                devinCredCache = cred
+            }
             let (status, data, _) = try await httpRequest(
                 cred.apiServerURL + "/exa.seat_management_pb.SeatManagementService/GetUserStatus",
                 method: "POST",
@@ -424,11 +441,13 @@ enum UsageService {
                 ]])
             let err = jsonDict(data)
             if status == 401 || status == 403 || (err["code"] as? String == "unauthenticated") {
+                devinCredCache = nil // token rotated/expired — re-read next poll
                 throw UsageError.http(status, "Devin session rejected — sign in to the Devin app again")
             }
             guard status == 200, let plan = (err["userStatus"] as? [String: Any])?["planStatus"] as? [String: Any] else {
                 throw UsageError.http(status, "Devin usage unavailable")
             }
+            var u = ProviderUsage(name: "Devin")
             func quota(_ remKey: String, _ resetKey: String, _ secs: TimeInterval) -> UsageWindow? {
                 guard let rem = plan[remKey] as? Double ?? (plan[remKey] as? Int).map(Double.init)
                         ?? (plan[remKey] as? String).flatMap(Double.init) else { return nil }
@@ -440,11 +459,18 @@ enum UsageService {
             }
             u.session = quota("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", 86400)
             u.weekly = quota("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", 604800)
-            if u.session == nil && u.weekly == nil {
-                u.error = "Devin: this plan reports no quota data"
+            if !u.hasData { u.error = "Devin: this plan reports no quota data" }
+            if u.hasData { devinCache = u }
+            return devinCache ?? u
+        } catch {
+            if case UsageError.noCredentials = error {
+                devinCredBlockedUntil = Date().addingTimeInterval(30 * 60)
             }
-        } catch { u.error = error.localizedDescription }
-        return u
+            if let cached = devinCache { return cached }
+            var u = ProviderUsage(name: "Devin")
+            u.error = error.localizedDescription
+            return u
+        }
     }
 
     // Anthropic returns fractional seconds ("...22:59:59.843964+00:00"), which

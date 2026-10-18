@@ -12,11 +12,13 @@ struct PopoverView: View {
                 }
                 Text("MeowBar").font(.headline)
             }
-            ProviderBlock(usage: store.claude)
+            ProviderBlock(usage: store.claude, running: store.claudeRunning)
             Divider()
-            ProviderBlock(usage: store.codex)
-            Divider()
-            ProviderBlock(usage: store.devin)
+            ProviderBlock(usage: store.codex, running: store.codexRunning)
+            if store.devin.hasData {
+                Divider()
+                ProviderBlock(usage: store.devin, running: store.devinRunning)
+            }
             Divider()
             HStack {
                 Text("Updated " + (store.lastUpdated?.formatted(date: .omitted, time: .shortened) ?? "never"))
@@ -32,10 +34,24 @@ struct PopoverView: View {
 
 struct ProviderBlock: View {
     let usage: ProviderUsage
+    var running: Bool = false
+
+    private var titleColor: Color {
+        switch usage.name {
+        case "Claude": return Color(red: 0.85, green: 0.47, blue: 0.34) // anthropic coral
+        case "Codex": return Color(red: 0.06, green: 0.64, blue: 0.50)  // openai green
+        default: return .primary
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(usage.name).font(.subheadline).bold()
+            HStack(spacing: 5) {
+                Text(usage.name).font(.subheadline).bold().foregroundStyle(titleColor)
+                if running {
+                    Text("running").font(.caption2).foregroundStyle(.green)
+                }
+            }
             if let err = usage.error {
                 Text(err).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
