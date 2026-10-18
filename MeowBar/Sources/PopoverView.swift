@@ -16,6 +16,8 @@ struct PopoverView: View {
             Divider()
             ProviderBlock(usage: store.codex)
             Divider()
+            ProviderBlock(usage: store.devin)
+            Divider()
             HStack {
                 Text("Updated " + (store.lastUpdated?.formatted(date: .omitted, time: .shortened) ?? "never"))
                     .font(.caption).foregroundStyle(.secondary)
@@ -38,8 +40,9 @@ struct ProviderBlock: View {
                 Text(err).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             // Skip "—" placeholders when the error already explains missing data
+            let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
             if usage.session != nil || usage.error == nil {
-                WindowRow(title: "Session · 5h", w: usage.session)
+                WindowRow(title: sessionLabel, w: usage.session)
             }
             if usage.weekly != nil || usage.error == nil {
                 WindowRow(title: "Weekly · 7d", w: usage.weekly)

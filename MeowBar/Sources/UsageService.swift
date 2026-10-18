@@ -1,4 +1,6 @@
 import Foundation
+import CommonCrypto
+import SQLite3
 import UserNotifications
 
 // MARK: - Models
@@ -232,25 +234,114 @@ private func jwtAudience(_ jwt: String) -> String? {
     return (payload["aud"] as? [String])?.first ?? payload["aud"] as? String
 }
 
+// MARK: - Devin credentials (IDE secret storage)
+//
+// The Devin desktop app is a VS Code fork: extension secrets live in
+// ~/Library/Application Support/Devin/User/globalStorage/state.vscdb under
+// "secret://{...}" keys, each value a JSON {"type":"Buffer","data":[v,1,0,...]}
+// blob — "v10" prefix + AES-128-CBC ciphertext. The key is PBKDF2-SHA1 of the
+// "Devin Safe Storage" Keychain password (Chromium os_crypt convention).
+
+private let devinDBPath = NSHomeDirectory() +
+    "/Library/Application Support/Devin/User/globalStorage/state.vscdb"
+private let SQLITE_TRANSIENT_PTR = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+private func pbkdf2SHA1(password: String, salt: String, iterations: UInt32, keyLen: Int) -> Data? {
+    var out = [UInt8](repeating: 0, count: keyLen)
+    let ok = password.withCString { pw in salt.withCString { s in
+        CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), pw, strlen(pw), s, strlen(s),
+                             CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), iterations,
+                             &out, keyLen)
+    }}
+    return ok == kCCSuccess ? Data(out) : nil
+}
+
+private func aes128CBCDecrypt(key: Data, ciphertext: Data) -> Data? {
+    var outLen = 0
+    var out = [UInt8](repeating: 0, count: ciphertext.count + kCCBlockSizeAES128)
+    var iv = [UInt8](repeating: 0x20, count: kCCBlockSizeAES128) // 16 spaces, per os_crypt
+    let ok = key.withUnsafeBytes { k in ciphertext.withUnsafeBytes { c in
+        CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES),
+                CCOptions(kCCOptionPKCS7Padding),
+                k.baseAddress, k.count, &iv, c.baseAddress, c.count, &out, out.count, &outLen)
+    }}
+    return ok == kCCSuccess ? Data(out.prefix(outLen)) : nil
+}
+
+private func devinSecret(_ secretKey: String) throws -> String {
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(devinDBPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        throw UsageError.noCredentials("Devin IDE storage not found — sign in to the Devin app first")
+    }
+    defer { sqlite3_close(db) }
+    var stmt: OpaquePointer?
+    let key = "secret://{\"extensionId\":\"codeium.windsurf\",\"key\":\"\(secretKey)\"}"
+    guard sqlite3_prepare_v2(db, "SELECT value FROM ItemTable WHERE key = ?", -1, &stmt, nil) == SQLITE_OK else {
+        throw UsageError.noCredentials("Devin storage unreadable")
+    }
+    defer { sqlite3_finalize(stmt) }
+    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT_PTR)
+    guard sqlite3_step(stmt) == SQLITE_ROW,
+          let cStr = sqlite3_column_text(stmt, 0) else {
+        throw UsageError.noCredentials("Devin session not found — sign in to the Devin app first")
+    }
+    let blobJSON = String(cString: cStr)
+    guard let bytes = (jsonDict(Data(blobJSON.utf8))["data"] as? [Any])?
+            .compactMap({ ($0 as? NSNumber)?.uint8Value }),
+          bytes.count > 4, bytes[0] == UInt8(ascii: "v") else {
+        throw UsageError.noCredentials("Devin session format unrecognized")
+    }
+    let (status, pw) = runProcess("/usr/bin/security",
+        ["find-generic-password", "-s", "Devin Safe Storage", "-a", "Devin Key", "-w"])
+    guard status == 0, !pw.isEmpty else {
+        throw UsageError.noCredentials("Devin Safe Storage key unavailable — allow access if macOS asks")
+    }
+    guard let keyData = pbkdf2SHA1(password: pw.trimmingCharacters(in: .whitespacesAndNewlines),
+                                   salt: "saltysalt", iterations: 1003, keyLen: 16),
+          let plain = aes128CBCDecrypt(key: keyData, ciphertext: Data(bytes.dropFirst(3))),
+          let str = String(data: plain, encoding: .utf8) else {
+        throw UsageError.noCredentials("Could not decrypt Devin session")
+    }
+    return str
+}
+
+private struct DevinCredential {
+    var accessToken: String
+    var apiServerURL: String
+}
+
+private func loadDevinCredential() throws -> DevinCredential {
+    let sessions = try devinSecret("windsurf_auth.sessions")
+    let server = (try? devinSecret("windsurf_auth.apiServerUrl")) ?? "https://server.codeium.com"
+    guard let arr = try? JSONSerialization.jsonObject(with: Data(sessions.utf8)) as? [[String: Any]],
+          let token = arr.first?["accessToken"] as? String, !token.isEmpty else {
+        throw UsageError.noCredentials("No Devin session — sign in to the Devin app first")
+    }
+    return DevinCredential(accessToken: token, apiServerURL: server)
+}
+
 // MARK: - Usage fetches
 
 enum UsageService {
 
-    // True when the claude/codex CLI process exists and is burning CPU
+    // True when the claude/codex/devin CLI process exists and is burning CPU
     // (an idle REPL sits ~0%); heuristic for "a task is actually running".
-    static func activeCLIs() -> (claude: Bool, codex: Bool) {
+    // Names are matched case-sensitively so the "Devin" IDE app (capital D)
+    // doesn't count — only the lowercase `devin` CLI harness does.
+    static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool) {
         let (_, out) = runProcess("/bin/ps", ["-A", "-o", "%cpu=", "-o", "comm="])
-        var c = false, x = false
+        var c = false, x = false, d = false
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", omittingEmptySubsequences: true)
             guard parts.count >= 2, let cpu = Double(parts[0]), cpu > 1.5 else { continue }
-            switch URL(fileURLWithPath: String(parts[1])).lastPathComponent.lowercased() {
+            switch URL(fileURLWithPath: String(parts[1])).lastPathComponent {
             case "claude": c = true
             case "codex": x = true
+            case "devin": d = true
             default: break
             }
         }
-        return (c, x)
+        return (c, x, d)
     }
 
     // /api/oauth/usage is aggressively rate-limited (429 + Retry-After).
@@ -313,6 +404,47 @@ enum UsageService {
                 "ChatGPT-Account-Id": tokens["account_id"] as? String ?? "",
                 "User-Agent": "codex-cli",
             ])
+    }
+
+    // Devin quota: daily + weekly "remaining %" from GetUserStatus (Connect-RPC
+    // JSON). The IDE's stored session token authenticates via metadata.api_key.
+    static func fetchDevin() async -> ProviderUsage {
+        var u = ProviderUsage(name: "Devin")
+        do {
+            let cred = try loadDevinCredential()
+            let (status, data, _) = try await httpRequest(
+                cred.apiServerURL + "/exa.seat_management_pb.SeatManagementService/GetUserStatus",
+                method: "POST",
+                headers: ["Connect-Protocol-Version": "1"],
+                jsonBody: ["metadata": [
+                    "api_key": cred.accessToken,
+                    "ide_name": "windsurf", "ide_version": "3.10.67",
+                    "extension_name": "windsurf", "extension_version": "3.10.67",
+                    "locale": "en", "os_name": "macos", "os_arch": "arm64",
+                ]])
+            let err = jsonDict(data)
+            if status == 401 || status == 403 || (err["code"] as? String == "unauthenticated") {
+                throw UsageError.http(status, "Devin session rejected — sign in to the Devin app again")
+            }
+            guard status == 200, let plan = (err["userStatus"] as? [String: Any])?["planStatus"] as? [String: Any] else {
+                throw UsageError.http(status, "Devin usage unavailable")
+            }
+            func quota(_ remKey: String, _ resetKey: String, _ secs: TimeInterval) -> UsageWindow? {
+                guard let rem = plan[remKey] as? Double ?? (plan[remKey] as? Int).map(Double.init)
+                        ?? (plan[remKey] as? String).flatMap(Double.init) else { return nil }
+                var w = UsageWindow(usedPercent: max(0, 100 - rem), windowSeconds: secs)
+                if let ts = plan[resetKey] as? Double ?? (plan[resetKey] as? String).flatMap(Double.init) {
+                    w.resetsAt = Date(timeIntervalSince1970: ts)
+                }
+                return w
+            }
+            u.session = quota("dailyQuotaRemainingPercent", "dailyQuotaResetAtUnix", 86400)
+            u.weekly = quota("weeklyQuotaRemainingPercent", "weeklyQuotaResetAtUnix", 604800)
+            if u.session == nil && u.weekly == nil {
+                u.error = "Devin: this plan reports no quota data"
+            }
+        } catch { u.error = error.localizedDescription }
+        return u
     }
 
     // Anthropic returns fractional seconds ("...22:59:59.843964+00:00"), which

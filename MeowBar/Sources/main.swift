@@ -4,8 +4,10 @@ import SwiftUI
 final class UsageStore: ObservableObject {
     @Published var claude = ProviderUsage(name: "Claude")
     @Published var codex = ProviderUsage(name: "Codex")
+    @Published var devin = ProviderUsage(name: "Devin")
     @Published var claudeRunning = false
     @Published var codexRunning = false
+    @Published var devinRunning = false
     @Published var lastUpdated: Date?
     var onUpdate: (() -> Void)?
     private var timer: Timer?
@@ -28,17 +30,21 @@ final class UsageStore: ObservableObject {
         Task {
             async let c = UsageService.fetchClaude()
             async let x = UsageService.fetchCodex()
-            let (cl, co) = await (c, x)
-            let (cRun, xRun) = UsageService.activeCLIs()
+            async let d = UsageService.fetchDevin()
+            let (cl, co, dv) = await (c, x, d)
+            let (cRun, xRun, dRun) = UsageService.activeCLIs()
             await MainActor.run {
                 self.claude = cl
                 self.codex = co
+                self.devin = dv
                 self.claudeRunning = cRun
                 self.codexRunning = xRun
+                self.devinRunning = dRun
                 self.lastUpdated = Date()
                 let now = Date()
                 for s in [(name: "Claude", pct: Self.dispLeft(cl), worst: Self.worstUsed(cl), running: cRun),
-                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co), running: xRun)] {
+                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co), running: xRun),
+                          (name: "Devin", pct: Self.dispLeft(dv), worst: Self.worstUsed(dv), running: dRun)] {
                     let wasRunning = self.prevRunning[s.name] ?? false
                     let prevW = self.prevWorst[s.name] ?? -1
                     self.prevRunning[s.name] = s.running
@@ -53,6 +59,7 @@ final class UsageStore: ObservableObject {
                 }
                 Notifier.evaluate(cl)
                 Notifier.evaluate(co)
+                Notifier.evaluate(dv)
                 self.onUpdate?()
             }
         }
@@ -120,11 +127,12 @@ final class UsageStore: ObservableObject {
 
     var menuToolTip: String {
         func line(_ u: ProviderUsage) -> String {
-            let s = u.session?.usedPercent, w = u.weekly?.usedPercent
-            let nums = [
-                s.map { String(format: "5h %.0f%% left", 100 - $0) },
-                w.map { String(format: "7d %.0f%% left", 100 - $0) },
-            ].compactMap { $0 }.joined(separator: " · ")
+            func lbl(_ w: UsageWindow?) -> String? {
+                guard let w else { return nil }
+                let span = (w.windowSeconds ?? 0) >= 86400 ? "1d" : "\(Int((w.windowSeconds ?? 18000) / 3600))h"
+                return String(format: "%@ %.0f%% left", span, 100 - w.usedPercent)
+            }
+            let nums = [lbl(u.session), lbl(u.weekly)].compactMap { $0 }.joined(separator: " · ")
             return "\(u.name): " + (nums.isEmpty ? (u.error ?? "…") : nums)
         }
         return [line(claude), line(codex)].joined(separator: "    ")
