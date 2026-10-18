@@ -4,6 +4,15 @@ struct PopoverView: View {
     @ObservedObject var store: UsageStore
 
     var body: some View {
+        if #available(macOS 26.0, *) {
+            // Liquid Glass — dark tint keeps text readable over light windows
+            content.glassEffect(.regular.tint(.black.opacity(0.55)), in: .rect)
+        } else {
+            content.background(.ultraThickMaterial)
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
                 if let icon = Bundle.main.image(forResource: "icon") {
@@ -29,7 +38,6 @@ struct PopoverView: View {
         }
         .padding(12)
         .frame(width: 300)
-        .background(.ultraThickMaterial) // near-opaque backing — popover stays readable over light windows
     }
 }
 

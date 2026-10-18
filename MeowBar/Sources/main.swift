@@ -117,6 +117,7 @@ final class UsageStore: ObservableObject {
                 attrs[.font] = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             } else {
                 label = pct.map { String(format: " %.0f%%", $0) } ?? " –"
+                attrs[.font] = NSFont.systemFont(ofSize: 12, weight: .medium)
             }
             s.append(NSAttributedString(string: label, attributes: attrs))
             return s
