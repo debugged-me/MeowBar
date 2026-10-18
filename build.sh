@@ -22,4 +22,5 @@ ln -s /Applications "$STAGING/Applications"
 rm -f build/MeowBar.dmg
 hdiutil create -volname "MeowBar" -srcfolder "$STAGING" -ov -format UDZO build/MeowBar.dmg >/dev/null
 rm -rf "$STAGING"
+cp build/MeowBar.dmg ./MeowBar.dmg   # sits next to index.html — same layout as production
 echo "Built build/MeowBar.dmg"
