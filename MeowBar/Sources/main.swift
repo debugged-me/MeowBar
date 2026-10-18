@@ -44,10 +44,10 @@ final class UsageStore: ObservableObject {
             if let url = Bundle.main.url(forResource: resource, withExtension: "png"),
                let img = NSImage(contentsOf: url) {
                 img.isTemplate = true
-                img.size = NSSize(width: 13, height: 13)
+                img.size = NSSize(width: 16, height: 16)
                 let att = NSTextAttachment()
                 att.image = img
-                att.bounds = CGRect(x: 0, y: -2.5, width: 13, height: 13)
+                att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }
             s.append(NSAttributedString(string: pct.map { String(format: " %.0f%%", $0) } ?? " –",
