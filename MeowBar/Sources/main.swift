@@ -155,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
 
         popover.behavior = .transient
+        popover.delegate = self
         let host = NSHostingController(rootView: PopoverView(store: store))
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
@@ -168,9 +169,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Notifier.requestPermission()
 
         // .transient is unreliable for accessory apps — explicitly close on
-        // any outside click or keypress while the popover is up.
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] _ in
+        // any outside click while the popover is up.
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.popover.performClose(nil)
+        }
+        // The popover activates the app while open, so keypresses arrive here —
+        // any key dismisses it (nothing to type into anyway).
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard self?.popover.isShown == true else { return event }
+            self?.popover.performClose(nil)
+            return nil
         }
     }
 
@@ -182,7 +190,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.acknowledgeAlerts()
             store.refresh()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // Key window → controls render true tint colors (inactive windows
+            // draw them grayed) and keyDown events reach the local monitor.
+            NSApp.activate(ignoringOtherApps: true)
         }
+    }
+}
+
+extension AppDelegate: NSPopoverDelegate {
+    func popoverDidClose(_ notification: Notification) {
+        NSApp.deactivate()
     }
 }
 
