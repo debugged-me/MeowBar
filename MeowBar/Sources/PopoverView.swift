@@ -5,8 +5,8 @@ struct PopoverView: View {
 
     var body: some View {
         if #available(macOS 26.0, *) {
-            // Liquid Glass — dark tint keeps text readable over light windows
-            content.glassEffect(.regular.tint(.black.opacity(0.55)), in: .rect)
+            // Liquid Glass, untinted — samples whatever's behind and blends in
+            content.glassEffect(.regular, in: .rect)
         } else {
             content.background(.ultraThickMaterial)
         }
