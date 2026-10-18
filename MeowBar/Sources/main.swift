@@ -132,28 +132,10 @@ final class UsageStore: ObservableObject {
         onUpdate?()
     }
 
-    // The icon IS the meter: it fills bottom-up with used% — ghosted icon as
-    // track, full-color icon rising with usage (severity tints via text).
-    private func iconImage(_ resource: String, fillFrac f: Double?) -> NSImage? {
+    private func iconImage(_ resource: String) -> NSImage? {
         guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
-              let src = NSImage(contentsOf: url) else { return nil }
-        guard let f, f > 0.005 else {
-            src.size = NSSize(width: 16, height: 16)
-            return src
-        }
-        let size = NSSize(width: 16, height: 16)
-        let img = NSImage(size: size, flipped: false) { rect in
-            src.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.25)
-            let ctx = NSGraphicsContext.current
-            ctx?.saveGraphicsState()
-            ctx?.cgContext.clip(to: CGRect(x: 0, y: 0,
-                                           width: rect.width,
-                                           height: rect.height * min(max(f, 0), 1)))
-            src.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
-            ctx?.restoreGraphicsState()
-            return true
-        }
-        img.isTemplate = false
+              let img = NSImage(contentsOf: url) else { return nil }
+        img.size = NSSize(width: 16, height: 16)
         return img
     }
 
@@ -165,8 +147,7 @@ final class UsageStore: ObservableObject {
             let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
-            if let img = iconImage(resource, fillFrac: pct.map { (100 - $0) / 100 }) {
-                img.size = NSSize(width: 16, height: 16)
+            if let img = iconImage(resource) {
                 let att = NSTextAttachment()
                 att.image = img
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
@@ -220,6 +201,10 @@ final class UsageStore: ObservableObject {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
+    // Clicking the status item while the popover is open auto-dismisses it
+    // AND fires the action — without this guard the click reopens instead of
+    // closing. 0.4s is below human double-tap speed for a deliberate reopen.
+    private var popoverClosedAt = Date.distantPast
     let store = UsageStore()
     private var settingsWindow: NSWindow?
     private var islandPanel: NSPanel?
@@ -264,8 +249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.popover.performClose(nil)
         }
-        // The popover activates the app while open, so keypresses arrive here —
-        // any key dismisses it (nothing to type into anyway).
+        // Popover never takes key (battery-menu behavior) — typing goes to
+        // whatever app you're in. This only fires while we're key anyway
+        // (e.g. Settings open), in which case any key dismisses the popover.
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard self?.popover.isShown == true else { return event }
             self?.popover.performClose(nil)
@@ -352,6 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
             return
         }
+        if Date().timeIntervalSince(popoverClosedAt) < 0.4 { return }
         store.acknowledgeAlerts()
         store.refresh()
         if let bg = islandPanel?.contentView, islandPanel?.isVisible == true {
@@ -359,9 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
-        // Key window → controls render true tint colors (inactive windows
-        // draw them grayed) and keyDown events reach the local monitor.
-        NSApp.activate(ignoringOtherApps: true)
+        // No NSApp.activate on purpose: like the battery panel, the popover
+        // shows without stealing key status — the front app keeps its
+        // colored traffic lights and your keystrokes.
     }
 
 }
@@ -395,7 +382,7 @@ private final class IslandView: NSVisualEffectView {
 
 extension AppDelegate: NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
-        NSApp.deactivate()
+        popoverClosedAt = Date()
     }
 
     func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }

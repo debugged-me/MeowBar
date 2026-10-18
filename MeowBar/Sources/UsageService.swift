@@ -435,6 +435,31 @@ enum UsageService {
     private static var claudeCache: ProviderUsage? = nil
     private static var claudeBlockedUntil: Date = .distantPast
 
+    // Plan label ("Max", "Pro", "Team") from the same keychain blob — free,
+    // no extra call. subscriptionType comes first; rateLimitTier strings like
+    // "default_claude_max_20x" are normalized to the plan word.
+    private static var claudePlanCached = false
+    private static var claudePlan: String? = nil
+    private static func claudePlanName() -> String? {
+        if !claudePlanCached {
+            claudePlanCached = true
+            if let (cred, _) = try? loadClaudeCredentials(),
+               let oauth = cred["claudeAiOauth"] as? [String: Any] {
+                let raw = (oauth["subscriptionType"] as? String)
+                    ?? (oauth["rateLimitTier"] as? String)
+                if let r = raw?.lowercased() {
+                    if r.contains("max") { claudePlan = "Max" }
+                    else if r.contains("pro") { claudePlan = "Pro" }
+                    else if r.contains("team") { claudePlan = "Team" }
+                    else if r.contains("enterprise") { claudePlan = "Enterprise" }
+                    else if r.contains("free") { claudePlan = "Free" }
+                    else if let t = raw, !t.isEmpty { claudePlan = t.capitalized }
+                }
+            }
+        }
+        return claudePlan
+    }
+
     // `claude auth status --json` result: catches signed-out and metered
     // (non-subscription) billing before the Keychain dance. nil method =
     // unknown (CLI absent) — don't gate anything on it. A signed-out state is
@@ -510,6 +535,7 @@ enum UsageService {
                 }
                 u.session = claudeWindow(json, keys: ["five_hour", "fiveHour", "session", "session_5h"], seconds: 18000)
                 u.weekly = claudeWindow(json, keys: ["seven_day", "sevenDay", "weekly", "week"], seconds: 604800)
+                u.note = claudePlanName()
                 claudeCache = u
                 break
             }
@@ -779,6 +805,7 @@ enum UsageService {
         for w in [u.session, u.weekly].compactMap({ $0 }) {
             if let r = w.resetsAt, r < now { return nil }
         }
+        u.note = claudePlanName()
         return u
     }
 

@@ -17,18 +17,18 @@ struct PopoverView: View {
             HStack(spacing: 7) {
                 if let icon = Bundle.main.image(forResource: "icon") {
                     Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 26, height: 26)
+                        .frame(width: 22, height: 22)
                 }
                 Text("MeowBar").font(.headline)
             }
+            .padding(.horizontal, 2)
+
             ProviderBlock(usage: store.claude, running: store.claudeRunning, store: store)
-            Divider()
             ProviderBlock(usage: store.codex, running: store.codexRunning, store: store)
             if store.devin.isVisible {
-                Divider()
                 ProviderBlock(usage: store.devin, running: store.devinRunning, store: store)
             }
-            Divider()
+
             HStack {
                 Spacer()
                 Button {
@@ -41,6 +41,7 @@ struct PopoverView: View {
                 .help("Settings")
                 Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
             }
+            .padding(.horizontal, 2)
         }
         .padding(12)
         .frame(width: 300)
@@ -60,14 +61,34 @@ struct ProviderBlock: View {
         }
     }
 
+    private var providerIcon: NSImage? {
+        Bundle.main.image(forResource: usage.name.lowercased())
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 5) {
+        VStack(alignment: .leading, spacing: 7) {
+            // header: icon + name + running badge …… plan pill
+            HStack(spacing: 6) {
+                if let icon = providerIcon {
+                    Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
+                        .frame(width: 13, height: 13)
+                }
                 Text(usage.name).font(.subheadline).bold().foregroundStyle(brandColor)
                 if running {
                     Text("running").font(.caption2).foregroundStyle(.green)
                 }
+                Spacer()
+                if usage.note != nil || usage.noteAccent != nil {
+                    HStack(spacing: 3) {
+                        if let note = usage.note { Text(note) }
+                        if let accent = usage.noteAccent { Text(accent).foregroundStyle(.green) }
+                    }
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(brandColor.opacity(0.14), in: .capsule)
+                }
             }
+
             if let err = usage.error {
                 Text(err).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 if let action = usage.action {
@@ -78,14 +99,7 @@ struct ProviderBlock: View {
                     .controlSize(.small)
                 }
             }
-            // Plan line sits above the bars (unlimited plans have no bars).
-            if usage.note != nil || usage.noteAccent != nil {
-                HStack(spacing: 4) {
-                    if let note = usage.note { Text(note).foregroundStyle(.secondary) }
-                    if let accent = usage.noteAccent { Text(accent).foregroundStyle(.green) }
-                }
-                .font(.caption)
-            }
+
             let unlimited = usage.noteAccent == "unlimited" && !usage.hasData
             if !unlimited && (usage.hasData || usage.error == nil) {
                 let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
@@ -93,6 +107,8 @@ struct ProviderBlock: View {
                 WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
+        .padding(10)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -110,11 +126,20 @@ struct WindowRow: View {
                 HStack {
                     Text(title).font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(Int(w.usedPercent))% used · \(Int(max(0, 100 - w.usedPercent)))% left")
-                        .font(.caption).monospacedDigit()
+                    Text("\(Int(w.usedPercent))%").font(.caption.weight(.semibold)).monospacedDigit()
+                        + Text(" used · \(Int(max(0, 100 - w.usedPercent)))% left")
+                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
-                ProgressView(value: min(w.usedPercent, 100) / 100)
-                    .tint(barColor)
+                // Custom capsule bar — ProgressView.tint is neutralized inside
+                // the glass popover on macOS 26 and renders gray regardless.
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.15))
+                        Capsule().fill(barColor)
+                            .frame(width: max(0, geo.size.width * min(w.usedPercent, 100) / 100))
+                    }
+                }
+                .frame(height: 6)
                 HStack {
                     Text(resetText).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     Spacer()
