@@ -415,12 +415,19 @@ enum UsageService {
     // Names are matched case-sensitively so the "Devin" IDE app (capital D)
     // doesn't count — only the lowercase `devin` CLI harness does.
     static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool) {
-        let (_, out) = runProcess("/bin/ps", ["-A", "-o", "%cpu=", "-o", "comm="])
+        // ucomm is the executable name on macOS; comm is a truncated path and
+        // can hide `codex`/`claude` when they live inside an editor extension.
+        let (_, out) = runProcess("/bin/ps", ["-A", "-o", "pid=", "-o", "%cpu=", "-o", "ucomm="])
         var c = false, x = false, d = false
         for line in out.split(separator: "\n") {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard parts.count >= 2, let cpu = Double(parts[0]), cpu > 1.5 else { continue }
-            switch URL(fileURLWithPath: String(parts[1])).lastPathComponent {
+            let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard parts.count >= 3, let pid = Int32(parts[0]),
+                  let cpu = Double(parts[1]), cpu > 1.5 else { continue }
+            // Ignore only the short-lived app-server MeowBar itself launches
+            // for usage data. An IDE-owned app-server can represent real work.
+            if meowbarCodexProcesses.contains(pid) { continue }
+            let executable = String(parts[2]).trimmingCharacters(in: .whitespaces)
+            switch executable {
             case "claude": c = true
             case "codex": x = true
             case "devin": d = true
@@ -438,23 +445,27 @@ enum UsageService {
     // Plan label ("Max", "Pro", "Team") from the same keychain blob — free,
     // no extra call. subscriptionType comes first; rateLimitTier strings like
     // "default_claude_max_20x" are normalized to the plan word.
-    private static var claudePlanCached = false
     private static var claudePlan: String? = nil
+    private static func displayPlanName(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let lower = raw.lowercased()
+        if lower.contains("enterprise") { return "Enterprise" }
+        if lower.contains("team") { return "Team" }
+        if lower.contains("business") { return "Business" }
+        if lower.contains("max") { return "Max" }
+        if lower.contains("plus") { return "Plus" }
+        if lower.contains("pro") { return "Pro" }
+        if lower.contains("free") { return "Free" }
+        return raw.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
     private static func claudePlanName() -> String? {
-        if !claudePlanCached {
-            claudePlanCached = true
+        if claudePlan == nil {
             if let (cred, _) = try? loadClaudeCredentials(),
                let oauth = cred["claudeAiOauth"] as? [String: Any] {
                 let raw = (oauth["subscriptionType"] as? String)
                     ?? (oauth["rateLimitTier"] as? String)
-                if let r = raw?.lowercased() {
-                    if r.contains("max") { claudePlan = "Max" }
-                    else if r.contains("pro") { claudePlan = "Pro" }
-                    else if r.contains("team") { claudePlan = "Team" }
-                    else if r.contains("enterprise") { claudePlan = "Enterprise" }
-                    else if r.contains("free") { claudePlan = "Free" }
-                    else if let t = raw, !t.isEmpty { claudePlan = t.capitalized }
-                }
+                claudePlan = displayPlanName(raw)
             }
         }
         return claudePlan
@@ -494,8 +505,14 @@ enum UsageService {
     }
 
     static func fetchClaude() async -> ProviderUsage {
-        if let cached = claudeCache, Date() < claudeBlockedUntil { return cached }
+        if var cached = claudeCache, Date() < claudeBlockedUntil {
+            cached.note = cached.note ?? claudePlanName()
+            return cached
+        }
         var u = ProviderUsage(name: "Claude")
+        // The plan comes from local credentials and remains useful even when
+        // the usage endpoint is temporarily rate-limited or unavailable.
+        u.note = claudePlanName()
         // Bridge installed → Claude Code pushes fresh numbers on every render;
         // no API polling at all (this is what kills the 429s). Snapshot wins.
         if StatuslineBridge.isInstalled {
@@ -535,7 +552,6 @@ enum UsageService {
                 }
                 u.session = claudeWindow(json, keys: ["five_hour", "fiveHour", "session", "session_5h"], seconds: 18000)
                 u.weekly = claudeWindow(json, keys: ["seven_day", "sevenDay", "weekly", "week"], seconds: 604800)
-                u.note = claudePlanName()
                 claudeCache = u
                 break
             }
@@ -613,7 +629,8 @@ enum UsageService {
               let rlRes = rpc[3]?["result"] as? [String: Any] else {
             throw UsageError.actionable("Codex didn't answer — retrying", nil)
         }
-        if let account = acctRes["account"] as? [String: Any],
+        let account = acctRes["account"] as? [String: Any]
+        if let account,
            (account["type"] as? String) == "apiKey" {
             u.error = "Codex is signed in with an API key, which has no plan limits — sign in with ChatGPT to see them"
             u.action = .runInTerminal("codex login")
@@ -631,11 +648,12 @@ enum UsageService {
         u.session = appServerWindow(rl["primary"])
         u.weekly = appServerWindow(rl["secondary"])
         let credits = rl["credits"] as? [String: Any] ?? [:]
+        let plan = displayPlanName((rl["planType"] as? String) ?? (account?["planType"] as? String))
         if credits["unlimited"] as? Bool == true {
-            u.note = (rl["planType"] as? String)?.capitalized ?? "Plan"
+            u.note = plan ?? "Plan"
             u.noteAccent = "unlimited"
-        } else if let plan = rl["planType"] as? String, !plan.isEmpty {
-            u.note = plan.capitalized
+        } else {
+            u.note = plan
         }
         if !u.hasData { u.error = "Codex hasn't reported any limits yet — they appear after you first use Codex" }
         return u
@@ -1010,6 +1028,28 @@ enum StatuslineBridge {
 
 // MARK: - codex app-server (JSON-RPC over stdio)
 
+private final class ProcessIDRegistry: @unchecked Sendable {
+    private var ids = Set<Int32>()
+    private let lock = NSLock()
+
+    func insert(_ id: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        ids.insert(id)
+    }
+
+    func remove(_ id: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        ids.remove(id)
+    }
+
+    func contains(_ id: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return ids.contains(id)
+    }
+}
+
+private let meowbarCodexProcesses = ProcessIDRegistry()
+
 private enum CodexRPC {
     // One-shot session: initialize → initialized → account/read +
     // account/rateLimits/read, then terminate. Read-only; never touches
@@ -1024,9 +1064,13 @@ private enum CodexRPC {
         do { try p.run() } catch {
             throw UsageError.noCredentials("Couldn't start Codex: \(error.localizedDescription)")
         }
+        meowbarCodexProcesses.insert(p.processIdentifier)
         // Watchdog: a stuck server must never block a refresh cycle.
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) { p.terminate() }
-        defer { p.terminate() }
+        defer {
+            meowbarCodexProcesses.remove(p.processIdentifier)
+            p.terminate()
+        }
 
         let stdin = inPipe.fileHandleForWriting
         func send(_ msg: [String: Any]) {

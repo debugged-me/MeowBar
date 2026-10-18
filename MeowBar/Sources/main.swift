@@ -1,4 +1,5 @@
 import Cocoa
+import QuartzCore
 import SwiftUI
 
 final class UsageStore: ObservableObject {
@@ -10,12 +11,20 @@ final class UsageStore: ObservableObject {
     @Published var devinRunning = false
     @Published var lastUpdated: Date?
     var onUpdate: (() -> Void)?
+    var onAlert: (() -> Void)?
     private var timer: Timer?
+    private var activityTimer: Timer?
+    private var activityCheckInFlight = false
     // Transient menu-bar alerts: armed on state edges (task finished, limit
     // reached), auto-clear after alertTTL or instantly on click.
     private var alertText: [String: String] = [:]
     private var alertUntil: [String: Date] = [:]
-    private var prevRunning: [String: Bool] = [:]
+    // A CPU spike is not a task. Rapid samples let IDE-hosted agents appear as
+    // running promptly, while confirmation in both directions filters helper
+    // startup and prevents false "task done" messages.
+    private var busySamples: [String: Int] = [:]
+    private var idleSamples: [String: Int] = [:]
+    private var confirmedRunning: [String: Bool] = [:]
     private var prevWorst: [String: Double] = [:]
     private let alertTTL: TimeInterval = 60
     private var demoActive = false
@@ -23,8 +32,12 @@ final class UsageStore: ObservableObject {
     func start() {
         if injectDemo() { return }
         refresh()
+        sampleActivity()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refresh()
+        }
+        activityTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.sampleActivity()
         }
     }
 
@@ -60,26 +73,18 @@ final class UsageStore: ObservableObject {
             async let x = UsageService.fetchCodex()
             async let d = UsageService.fetchDevin()
             let (cl, co, dv) = await (c, x, d)
-            let (cRun, xRun, dRun) = UsageService.activeCLIs()
             await MainActor.run {
                 self.claude = cl
                 self.codex = co
                 self.devin = dv
-                self.claudeRunning = cRun
-                self.codexRunning = xRun
-                self.devinRunning = dRun
                 self.lastUpdated = Date()
                 let now = Date()
-                for s in [(name: "Claude", pct: Self.dispLeft(cl), worst: Self.worstUsed(cl), running: cRun),
-                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co), running: xRun),
-                          (name: "Devin", pct: Self.dispLeft(dv), worst: Self.worstUsed(dv), running: dRun)] {
-                    let wasRunning = self.prevRunning[s.name] ?? false
+                for s in [(name: "Claude", pct: Self.dispLeft(cl), worst: Self.worstUsed(cl)),
+                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co)),
+                          (name: "Devin", pct: Self.dispLeft(dv), worst: Self.worstUsed(dv))] {
                     let prevW = self.prevWorst[s.name] ?? -1
-                    self.prevRunning[s.name] = s.running
                     if let w = s.worst { self.prevWorst[s.name] = w }
-                    if wasRunning && !s.running {
-                        self.arm(s.name, "task done", now: now)
-                    } else if let w = s.worst, w >= 90, prevW < 90 {
+                    if let w = s.worst, w >= 90, prevW < 90 {
                         self.arm(s.name, (s.pct ?? 0) <= 0 ? "limit reached" : "nearing limit", now: now)
                     } else if (s.pct ?? 1) <= 0, self.alertText[s.name] == "nearing limit" {
                         self.arm(s.name, "limit reached", now: now)
@@ -91,6 +96,50 @@ final class UsageStore: ObservableObject {
                 self.onUpdate?()
             }
         }
+    }
+
+    private func sampleActivity() {
+        guard !activityCheckInFlight else { return }
+        activityCheckInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let activity = UsageService.activeCLIs()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.activityCheckInFlight = false
+                let now = Date()
+                for sample in [("Claude", activity.claude),
+                               ("Codex", activity.codex),
+                               ("Devin", activity.devin)] {
+                    if self.recordActivity(for: sample.0, isBusy: sample.1) {
+                        self.arm(sample.0, "task done", now: now)
+                    }
+                }
+                self.claudeRunning = self.confirmedRunning["Claude"] == true
+                self.codexRunning = self.confirmedRunning["Codex"] == true
+                self.devinRunning = self.confirmedRunning["Devin"] == true
+                self.onUpdate?()
+            }
+        }
+    }
+
+    private func recordActivity(for name: String, isBusy: Bool) -> Bool {
+        if isBusy {
+            busySamples[name, default: 0] += 1
+            idleSamples[name] = 0
+            if busySamples[name, default: 0] >= 2 { confirmedRunning[name] = true }
+            return false
+        }
+
+        busySamples[name] = 0
+        guard confirmedRunning[name] == true else {
+            idleSamples[name] = 0
+            return false
+        }
+        idleSamples[name, default: 0] += 1
+        guard idleSamples[name, default: 0] >= 3 else { return false }
+        confirmedRunning[name] = false
+        idleSamples[name] = 0
+        return true
     }
 
     static func worstUsed(_ u: ProviderUsage) -> Double? {
@@ -123,6 +172,7 @@ final class UsageStore: ObservableObject {
     private func arm(_ name: String, _ text: String, now: Date) {
         alertText[name] = text
         alertUntil[name] = now.addingTimeInterval(alertTTL)
+        onAlert?()
     }
 
     // Click = "seen it": clear all live alerts immediately.
@@ -229,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusItem.button?.toolTip = self.store.menuToolTip
             self.layoutIsland()
         }
+        store.onAlert = { [weak self] in self?.flashMenuItem() }
         store.start()
         Notifier.requestPermission()
 
@@ -346,9 +397,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
-        // No NSApp.activate on purpose: like the battery panel, the popover
-        // shows without stealing key status — the front app keeps its
-        // colored traffic lights and your keystrokes.
+        // The popover window is a non-activating panel: makeKey() gives it
+        // key status WITHOUT activating our app — the front app keeps its
+        // menus and colored traffic lights. Key status matters because
+        // Tahoe glass (NSGlassView) and vibrant text render washed-out in
+        // non-key windows, and there's no .active override for them.
+        // Cost: a keystroke typed while the popover is open goes to us —
+        // the local monitor below dismisses the popover on it.
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // Triple fade-pulse on the status item (and island) so a new alert —
+    // "task done", "limit reached" — catches the eye without a banner.
+    private func flashMenuItem() {
+        func pulse(_ view: NSView?) {
+            guard let view else { return }
+            view.wantsLayer = true
+            let a = CABasicAnimation(keyPath: "opacity")
+            a.fromValue = 1.0
+            a.toValue = 0.25
+            a.duration = 0.3
+            a.autoreverses = true
+            a.repeatCount = 3
+            view.layer?.add(a, forKey: "meowbar.flash")
+        }
+        pulse(statusItem.button)
+        pulse(islandPanel?.contentView)
     }
 
 }
