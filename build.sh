@@ -14,3 +14,12 @@ swiftc -O -target arm64-apple-macos14.0 \
 
 codesign --force --sign - "$APP"
 echo "Built $APP"
+
+# Distributable DMG: app + /Applications symlink for drag-install
+STAGING=$(mktemp -d)
+cp -R "$APP" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+rm -f build/MeowBar.dmg
+hdiutil create -volname "MeowBar" -srcfolder "$STAGING" -ov -format UDZO build/MeowBar.dmg >/dev/null
+rm -rf "$STAGING"
+echo "Built build/MeowBar.dmg"
