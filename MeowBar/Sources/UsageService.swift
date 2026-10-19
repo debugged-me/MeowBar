@@ -51,29 +51,11 @@ private func jsonDict(_ data: Data) -> [String: Any] {
 // MARK: - Keychain (Claude Code credentials)
 
 private func runProcess(_ launch: String, _ args: [String], timeout: TimeInterval = 30) -> (Int32, String) {
-    let p = Process(), pipe = Pipe()
+    let p = Process()
     p.executableURL = URL(fileURLWithPath: launch)
     p.arguments = args
-    p.standardOutput = pipe
-    p.standardError = FileHandle.nullDevice
-    do { try p.run() } catch { return (-1, "") }
-    // Drain stdout on a background thread while bounded by a timeout: a >64KB
-    // write would otherwise fill the pipe and deadlock waitUntilExit, and a
-    // stuck child (e.g. an unanswered Keychain prompt) must not hang a fetch.
-    var out = Data()
-    let group = DispatchGroup()
-    group.enter()
-    DispatchQueue.global().async {
-        out = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        group.leave()
-    }
-    if group.wait(timeout: .now() + timeout) == .timedOut {
-        p.terminate()
-        _ = group.wait(timeout: .now() + 5)
-        return (-2, String(data: out, encoding: .utf8) ?? "")
-    }
-    return (p.terminationStatus, String(data: out, encoding: .utf8) ?? "")
+    let (status, out) = ProcessRunner.run(p, timeout: timeout)
+    return (status, String(data: out, encoding: .utf8) ?? "")
 }
 
 // GUI apps inherit a minimal PATH, so `which` alone misses CLIs installed via
@@ -108,10 +90,16 @@ private let claudeService = "Claude Code-credentials"
 
 // Keychain accounts holding a "Claude Code-credentials" item (current user first).
 // Duplicate items can exist, e.g. after a macOS username change.
+// Dumping the whole login keychain every 30s just to find account names is
+// wasteful — they change about never. Cached 10 min (only a clean dump).
+private var claudeAccountsCache: (at: Date, accounts: [String])?
+
 private func claudeKeychainAccounts() -> [String] {
+    if let c = claudeAccountsCache, Date().timeIntervalSince(c.at) < 600 { return c.accounts }
     var accts = [NSUserName()]
     let loginKeychain = NSHomeDirectory() + "/Library/Keychains/login.keychain-db"
-    let (_, dump) = runProcess("/usr/bin/security", ["dump-keychain", loginKeychain])
+    let (status, dump) = runProcess("/usr/bin/security", ["dump-keychain", loginKeychain])
+    defer { if status == 0 { claudeAccountsCache = (Date(), accts) } }
     var acct: String? = nil, isClaude = false
     func flush() {
         if isClaude, let a = acct, !accts.contains(a) { accts.append(a) }
@@ -362,6 +350,9 @@ private struct DevinCredential {
     var apiServerURL: String
 }
 
+// How much of a transcript the turn trackers read the first time they see it.
+private let tailBytes: UInt64 = 256 * 1024
+
 // Codex persists explicit task_started/task_complete markers in each local
 // rollout. Reading those markers is more accurate than CPU alone because an
 // IDE task remains active while it waits on the model or a tool. Files are
@@ -385,7 +376,10 @@ private final class CodexTurnTracker: @unchecked Sendable {
         if end < state.offset { state = State() }
         // Small overlap protects against observing a line while it is being
         // appended. Reprocessing a marker is harmless because it is a state.
-        let start = state.offset == 0 ? 0 : state.offset - min(state.offset, 4096)
+        // First sight reads only the tail: rollouts run to many MB, and the
+        // latest markers are all that matter (a cut first line just fails to
+        // parse).
+        let start = state.offset == 0 ? end - min(end, tailBytes) : state.offset - min(state.offset, 4096)
         handle.seek(toFileOffset: start)
         let data = handle.readDataToEndOfFile()
         for line in data.split(separator: 0x0A) {
@@ -453,7 +447,7 @@ private final class ClaudeTurnTracker: @unchecked Sendable {
         let end = handle.seekToEndOfFile()
         var state = states[path] ?? State()
         if end < state.offset { state = State() }
-        let start = state.offset == 0 ? 0 : state.offset - min(state.offset, 4096)
+        let start = state.offset == 0 ? end - min(end, tailBytes) : state.offset - min(state.offset, 4096)
         handle.seek(toFileOffset: start)
         let data = handle.readDataToEndOfFile()
         for line in data.split(separator: 0x0A) {
@@ -521,6 +515,7 @@ private final class DevinTurnTracker: @unchecked Sendable {
 }
 
 private let devinTurnTracker = DevinTurnTracker()
+private let procScan = ProcScan()
 
 private func codexIDEHasActiveTask() -> Bool {
     let codexHome = NSHomeDirectory() + "/.codex"
@@ -573,27 +568,25 @@ enum UsageService {
     // (capital D, busy with UI) doesn't count — its agent turns come from the
     // ACP session log instead.
     static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool) {
-        // ucomm is the executable name on macOS; comm is a truncated path and
-        // can hide `codex`/`claude` when they live inside an editor extension.
-        let (_, out) = runProcess("/bin/ps", ["-A", "-o", "pid=", "-o", "%cpu=", "-o", "ucomm="])
+        // Executable names (ucomm) — a path can hide `codex`/`claude` when
+        // they live inside an editor extension. Read in-process (libproc),
+        // not by spawning `ps` every 2s.
+        let procs = procScan.sample(names: ["claude", "codex", "devin", "Devin"])
         let codexTurnActive = codexIDEHasActiveTask()
         let claudeTurnActive = claudeTurnTracker.hasActiveTurn()
         let devinTurnActive = devinTurnTracker.hasActiveTurn()
         var c = false, x = false, d = false
         var claudeExists = false, codexExists = false, devinExists = false
-        for line in out.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-            guard parts.count >= 3, let pid = Int32(parts[0]),
-                  let cpu = Double(parts[1]) else { continue }
-            let executable = String(parts[2]).trimmingCharacters(in: .whitespaces)
+        for proc in procs {
+            let executable = proc.name
             // Ignore only the short-lived processes MeowBar itself launches
             // (codex app-server for usage data, the session-clock prompt).
             // An IDE-owned app-server can represent real work.
-            if meowbarSpawned.contains(pid) { continue }
+            if meowbarSpawned.contains(proc.pid) { continue }
             if executable == "claude" { claudeExists = true }
             if executable == "codex" { codexExists = true }
             if executable == "devin" || executable == "Devin" { devinExists = true }
-            guard cpu > 1.5 else { continue }
+            guard proc.cpuPercent > 1.5 else { continue }
             switch executable {
             case "claude": c = true
             case "codex": x = true
@@ -1242,7 +1235,7 @@ extension UsageService {
         guard let bin = cliPath("claude") else { return false }
         let dir = StatuslineBridge.supportDir + "/clock"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let p = Process(), out = Pipe()
+        let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = ["-p", "hi", "--model", "haiku", "--tools", "",
                        "--no-session-persistence", "--setting-sources", "project",
@@ -1254,16 +1247,13 @@ extension UsageService {
         env["PATH"] = ((bin as NSString).deletingLastPathComponent) + ":/opt/homebrew/bin:/usr/local/bin:"
             + (env["PATH"] ?? "/usr/bin:/bin")
         p.environment = env
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        meowbarSpawned.insert(p.processIdentifier)
-        defer { meowbarSpawned.remove(p.processIdentifier) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 90) { p.terminate() }
-        let reply = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return p.terminationStatus == 0 && !reply.isEmpty
+        var pid: Int32 = 0
+        let (status, reply) = ProcessRunner.run(p, timeout: 90) {
+            pid = $0
+            meowbarSpawned.insert($0)
+        }
+        meowbarSpawned.remove(pid)
+        return status == 0 && !reply.isEmpty
     }
 }
 
@@ -1271,6 +1261,12 @@ private enum CodexRPC {
     // One-shot session: initialize → initialized → account/read +
     // account/rateLimits/read, then terminate. Read-only; never touches
     // ~/.codex. Server notifications (remoteControl/status etc.) are ignored.
+    //
+    // Output arrives on a readabilityHandler and the caller waits on a
+    // semaphore with a hard 10s deadline. The old loop blocked a Swift
+    // concurrency thread in availableData; that pool is only as wide as the
+    // CPU count, so a server (or a child of it) holding stdout open would
+    // have frozen every refresh after a handful of stalls.
     static func run(binary: String) throws -> [Int: [String: Any]] {
         let p = Process(), inPipe = Pipe(), outPipe = Pipe()
         p.executableURL = URL(fileURLWithPath: binary)
@@ -1278,32 +1274,29 @@ private enum CodexRPC {
         p.standardInput = inPipe
         p.standardOutput = outPipe
         p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch {
-            throw UsageError.noCredentials("Couldn't start Codex: \(error.localizedDescription)")
-        }
-        meowbarSpawned.insert(p.processIdentifier)
-        // Watchdog: a stuck server must never block a refresh cycle.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 10) { p.terminate() }
-        defer {
-            meowbarSpawned.remove(p.processIdentifier)
-            p.terminate()
-        }
 
         let stdin = inPipe.fileHandleForWriting
+        // Throwing write: a server that died mid-session is an error, not a
+        // crash (SIGPIPE is ignored app-wide; the legacy write() would raise).
         func send(_ msg: [String: Any]) {
-            guard let d = try? JSONSerialization.data(withJSONObject: msg) else { return }
-            stdin.write(d)
-            stdin.write("\n".data(using: .utf8)!)
+            guard var d = try? JSONSerialization.data(withJSONObject: msg) else { return }
+            d.append(0x0A)
+            try? stdin.write(contentsOf: d)
         }
-        send(["jsonrpc": "2.0", "id": 1, "method": "initialize",
-              "params": ["clientInfo": ["name": "meowbar", "version": "1.0"]]])
 
+        let lock = NSLock(), done = DispatchSemaphore(value: 0)
         var responses: [Int: [String: Any]] = [:]
-        var buf = Data(), requested = false
-        let reader = outPipe.fileHandleForReading
-        while !responses.keys.contains(3) {
-            let chunk = reader.availableData // blocks until data or EOF (watchdog)
-            if chunk.isEmpty { break }
+        var buf = Data(), requested = false, finished = false
+        // Reads, and the close in `defer`, share `lock`: a late handler call
+        // never touches a closed handle. Closed explicitly because a released
+        // handle that had a readabilityHandler can keep its fd open.
+        outPipe.fileHandleForReading.readabilityHandler = { h in
+            lock.lock(); defer { lock.unlock() }
+            guard !finished else { return }
+            let chunk = h.availableData
+            if chunk.isEmpty {
+                finished = true; done.signal(); return
+            }
             buf += chunk
             while let nl = buf.firstIndex(of: 0x0A) {
                 let line = Data(buf[..<nl]); buf = Data(buf[buf.index(after: nl)...])
@@ -1316,10 +1309,38 @@ private enum CodexRPC {
                     send(["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [String: Any]()])
                 }
             }
+            if responses[2] != nil, responses[3] != nil { finished = true; done.signal() }
         }
-        guard responses[2] != nil, responses[3] != nil else {
+
+        do { try p.run() } catch {
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            try? outPipe.fileHandleForReading.close()
+            try? stdin.close()
+            throw UsageError.noCredentials("Couldn't start Codex: \(error.localizedDescription)")
+        }
+        let pid = p.processIdentifier
+        meowbarSpawned.insert(pid)
+        defer {
+            lock.lock()
+            finished = true
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            try? outPipe.fileHandleForReading.close()
+            lock.unlock()
+            try? stdin.close()
+            if p.isRunning { p.terminate() }
+            meowbarSpawned.remove(pid)
+        }
+        send(["jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": ["clientInfo": ["name": "meowbar", "version": "1.0"]]])
+
+        // Watchdog: a stuck server must never block a refresh cycle.
+        _ = done.wait(timeout: .now() + 10)
+        lock.lock()
+        let result = responses
+        lock.unlock()
+        guard result[2] != nil, result[3] != nil else {
             throw UsageError.http(0, "Codex didn't answer")
         }
-        return responses
+        return result
     }
 }

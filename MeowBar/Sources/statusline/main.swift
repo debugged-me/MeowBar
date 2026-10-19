@@ -10,6 +10,10 @@ let supportDir = NSHomeDirectory() + "/Library/Application Support/MeowBar"
 let snapshotPath = supportDir + "/claude-statusline.json"
 let originalPath = supportDir + "/original-statusline.json"
 
+// A chained status line that exits without reading its stdin must not take
+// this helper down with SIGPIPE (Claude Code would show a blank line).
+signal(SIGPIPE, SIG_IGN)
+
 let stdinData = FileHandle.standardInput.readDataToEndOfFile()
 
 // --- snapshot --------------------------------------------------------------
@@ -57,7 +61,7 @@ func chain() -> String? {
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { return nil }
-    inp.fileHandleForWriting.write(stdinData)
+    try? inp.fileHandleForWriting.write(contentsOf: stdinData)
     try? inp.fileHandleForWriting.close()
     let result = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()

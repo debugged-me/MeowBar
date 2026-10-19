@@ -42,7 +42,7 @@ struct PopoverView: View {
 
     private var footer: some View {
         HStack(spacing: 6) {
-            CatView(mood: catMood)
+            CatView(mood: catMood, animating: store.popoverShown)
             if let at = store.lastUpdated {
                 Text("updated \(Countdown.ago(at))")
                     .font(.caption2.weight(.medium))
@@ -340,32 +340,49 @@ struct WindowRow: View {
     }
 }
 
-// The mascot: naps when nothing's running, trots while an agent works,
-// startles when a limit is close. Holds still under Reduce Motion.
+// The mascot: naps when nothing's running, bounces while an agent works,
+// wiggles when a limit is close — a few cycles each time the popover opens,
+// then still. Never animates off screen: the popover's view outlives the
+// popover, and a running animation kept the app at 10–20% CPU around the
+// clock; when `animating` drops, the effects leave the view tree. Still under
+// Reduce Motion. (macOS 14: still.)
 struct CatView: View {
     enum Mood { case napping, working, startled }
     let mood: Mood
     var size: CGFloat = 13
+    var animating = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
 
+    private var live: Bool { animating && !reduceMotion }
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { ctx in
-            let t = ctx.date.timeIntervalSinceReferenceDate
-            ZStack(alignment: .bottomLeading) {
-                Image(systemName: "cat.fill")
-                    .font(.system(size: size))
-                    .foregroundStyle(color)
-                    .scaleEffect(breath(t), anchor: .bottom)
-                    .rotationEffect(.degrees(tilt(t)), anchor: .bottom)
-                    .offset(y: hop(t))
-                badge(t)
-            }
-            .frame(width: size * 2.2, height: size * 1.5, alignment: .bottomLeading)
+        ZStack(alignment: .bottomLeading) {
+            cat
+            badge
         }
+        .frame(width: size * 2.2, height: size * 1.5, alignment: .bottomLeading)
         .help(caption)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(caption)
+    }
+
+    @ViewBuilder
+    private var cat: some View {
+        let image = Image(systemName: "cat.fill")
+            .font(.system(size: size))
+            .foregroundStyle(color)
+        // A few cycles each time the popover opens, then rest — looping
+        // effects cost ~10% CPU for as long as the popover stays open.
+        if live, #available(macOS 15.0, *) {
+            switch mood {
+            case .napping: image.symbolEffect(.breathe, options: .repeat(.periodic(2, delay: 0.4)))
+            case .working: image.symbolEffect(.bounce.up, options: .repeat(.periodic(4, delay: 0.3)))
+            case .startled: image.symbolEffect(.wiggle, options: .repeat(.periodic(3, delay: 0.8)))
+            }
+        } else {
+            image
+        }
     }
 
     private var caption: String {
@@ -385,41 +402,20 @@ struct CatView: View {
         }
     }
 
-    private func breath(_ t: Double) -> Double {
-        switch mood {
-        case .napping: return 1 + 0.04 * sin(t * 2 * .pi / 3.2)
-        case .startled: return t.truncatingRemainder(dividingBy: 2) < 0.15 ? 1.1 : 1
-        case .working: return 1
-        }
-    }
-
-    private func tilt(_ t: Double) -> Double {
-        switch mood {
-        case .working: return 5 * sin(t * 2 * .pi * 1.8)
-        case .startled:
-            // A short shake every 2s, decaying.
-            let p = t.truncatingRemainder(dividingBy: 2)
-            return p < 0.45 ? 7 * sin(p * 2 * .pi * 9) * (1 - p / 0.45) : 0
-        case .napping: return 0
-        }
-    }
-
-    private func hop(_ t: Double) -> Double {
-        mood == .working ? -abs(sin(t * 2 * .pi * 1.8)) * size * 0.18 : 0
-    }
-
     @ViewBuilder
-    private func badge(_ t: Double) -> some View {
+    private var badge: some View {
         switch mood {
         case .napping:
-            // Two z's drifting up and fading, staggered.
-            ForEach(0..<2) { i in
-                let p = (t / 2.6 + Double(i) * 0.5).truncatingRemainder(dividingBy: 1)
-                Text("z")
-                    .font(.system(size: size * (i == 0 ? 0.55 : 0.45), weight: .bold, design: .rounded))
-                    .foregroundStyle(supportingText(colorScheme))
-                    .opacity(sin(p * .pi))
-                    .offset(x: size * (1.4 + 0.3 * p), y: -size * (0.6 + 0.5 * p))
+            // System symbol effect, not a SwiftUI repeatForever animation: the
+            // latter kept ticking after its view was removed (~6% CPU, closed).
+            let z = Image(systemName: "zzz")
+                .font(.system(size: size * 0.5, weight: .bold))
+                .foregroundStyle(supportingText(colorScheme))
+                .offset(x: size * 1.3, y: -size * 0.7)
+            if live, #available(macOS 15.0, *) {
+                z.symbolEffect(.variableColor.iterative.dimInactiveLayers, options: .repeat(.periodic(2, delay: 0.4)))
+            } else {
+                z
             }
         case .startled:
             Text("!")

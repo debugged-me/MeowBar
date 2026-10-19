@@ -14,6 +14,9 @@ final class UsageStore: ObservableObject {
     @Published var history: [String: [UsageSample]] = [:]
     @Published var clockStarting = false
     @Published var update: UpdateInfo?
+    // The popover's view stays alive while closed; anything animated must
+    // check this or it keeps burning CPU off screen.
+    @Published var popoverShown = false
     var onUpdate: (() -> Void)?
     var onAlert: (() -> Void)?
     private var timer: Timer?
@@ -42,7 +45,7 @@ final class UsageStore: ObservableObject {
         sampleActivity()
         checkForUpdate()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.refreshIfDue()
         }
         activityTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.sampleActivity()
@@ -112,18 +115,33 @@ final class UsageStore: ObservableObject {
         return true
     }
 
+    // Usage only moves while an agent works. Idle (nothing running, popover
+    // closed) → every 2 min instead of every 30s: a quarter of the API calls
+    // and `codex app-server` launches, and fewer Anthropic 429s.
+    private func refreshIfDue() {
+        let busy = popoverShown || claudeRunning || codexRunning || devinRunning
+        if !busy, let last = lastUpdated, Date().timeIntervalSince(last) < 115 { return }
+        refresh()
+    }
+
+    // One refresh at a time. A slow round (Keychain prompt, CLI timeouts,
+    // offline) can outlast the 30s timer; without this they'd pile up.
+    private var refreshInFlight = false
+
     func refresh() {
-        if demoActive { return }
+        if demoActive || refreshInFlight { return }
+        refreshInFlight = true
         Task {
             async let c = UsageService.fetchClaude()
             async let x = UsageService.fetchCodex()
             async let d = UsageService.fetchDevin()
             let (cl, co, dv) = await (c, x, d)
             await MainActor.run {
+                self.refreshInFlight = false
                 let now = Date()
-                self.claude = self.withClock(Self.merge(cl, over: self.claude, now: now), now: now)
-                self.codex = Self.merge(co, over: self.codex, now: now)
-                self.devin = Self.merge(dv, over: self.devin, now: now)
+                self.claude = self.withClock(ProviderUsage.merge(cl, over: self.claude, now: now), now: now)
+                self.codex = ProviderUsage.merge(co, over: self.codex, now: now)
+                self.devin = ProviderUsage.merge(dv, over: self.devin, now: now)
                 self.lastUpdated = now
                 for u in [self.claude, self.codex, self.devin] {
                     let pct = u.displayLeft, worst = u.worstUsed
@@ -143,19 +161,6 @@ final class UsageStore: ObservableObject {
                 self.onUpdate?()
             }
         }
-    }
-
-    // A transient failure (rate limit, network, server hiccup — anything
-    // without a fix-it action) keeps the last good numbers, marked stale, for
-    // up to 6h instead of flashing an error. Sign-in problems still show.
-    static func merge(_ new: ProviderUsage, over old: ProviderUsage, now: Date) -> ProviderUsage {
-        if !new.hasData, new.action == nil, old.hasData,
-           now.timeIntervalSince(old.fetchedAt) < 6 * 3600 {
-            var kept = old.normalized(now: now)
-            kept.isStale = true
-            return kept
-        }
-        return new.normalized(now: now)
     }
 
     private func persist(now: Date) {
@@ -224,11 +229,17 @@ final class UsageStore: ObservableObject {
                                ("Devin", activity.devin)] {
                     if self.recordActivity(for: sample.0, isBusy: sample.1) {
                         self.arm(sample.0, "task done", now: now)
+                        self.refresh() // the finished task just moved the numbers
                     }
                 }
-                self.claudeRunning = self.confirmedRunning["Claude"] == true
-                self.codexRunning = self.confirmedRunning["Codex"] == true
-                self.devinRunning = self.confirmedRunning["Devin"] == true
+                // Publish only changes: every assignment re-renders the
+                // popover's view graph, even while it's closed.
+                let c = self.confirmedRunning["Claude"] == true
+                let x = self.confirmedRunning["Codex"] == true
+                let d = self.confirmedRunning["Devin"] == true
+                if self.claudeRunning != c { self.claudeRunning = c }
+                if self.codexRunning != x { self.codexRunning = x }
+                if self.devinRunning != d { self.devinRunning = d }
                 self.onUpdate?()
             }
         }
@@ -267,10 +278,15 @@ final class UsageStore: ObservableObject {
         onUpdate?()
     }
 
+    // Loaded once — the menu title is rebuilt every 2s.
+    private var iconCache: [String: NSImage] = [:]
+
     private func iconImage(_ resource: String) -> NSImage? {
+        if let img = iconCache[resource] { return img }
         guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
               let img = NSImage(contentsOf: url) else { return nil }
         img.size = NSSize(width: 16, height: 16)
+        iconCache[resource] = img
         return img
     }
 
@@ -423,21 +439,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // clicks on our own status item through here; those belong to
         // togglePopover, or one click would close and toggle at once.
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self, self.popover.isShown else { return }
+            guard let self else { return }
             let p = NSEvent.mouseLocation
             if self.statusItem.button?.window?.frame.contains(p) == true
                 || (self.islandPanel?.isVisible == true && self.islandPanel?.frame.contains(p) == true) {
                 return
             }
+            if self.clearOrphanedPopover() { return }
+            guard self.popover.isShown else { return }
             if !self.popoverClosing { self.closedByOutsideClick = true }
             self.popover.performClose(nil)
+        }
+        // A popover left open across sleep, screen lock or a display change
+        // can lose its anchor: AppKit then reports it closed while its window
+        // stays on screen, deaf to clicks. Close it first, like system menus.
+        let ws = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
+                     NSWorkspace.sessionDidResignActiveNotification] {
+            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.dismissPopover()
+            }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.dismissPopover()
+        }
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsLocked"),
+                                                            object: nil, queue: .main) { [weak self] _ in
+            self?.dismissPopover()
         }
         // Popover never takes key (battery-menu behavior) — typing goes to
         // whatever app you're in. This only fires while we're key anyway
         // (e.g. Settings open), in which case any key dismisses the popover.
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard self?.popover.isShown == true else { return event }
-            self?.popover.performClose(nil)
+            guard let self else { return event }
+            if self.clearOrphanedPopover() { return nil }
+            guard self.popover.isShown else { return event }
+            self.popover.performClose(nil)
             return nil
         }
 
@@ -575,7 +613,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tf.frame = NSRect(x: pad, y: 3, width: sz.width, height: h - 6)
     }
 
+    private var popoverWindow: NSWindow? { popover.contentViewController?.view.window }
+
+    // AppKit says closed but the window is still up (anchor lost) — take it
+    // down. True if there was one: the click that found it was a "close".
+    @discardableResult
+    private func clearOrphanedPopover() -> Bool {
+        guard !popover.isShown, let w = popoverWindow, w.isVisible else { return false }
+        w.orderOut(nil)
+        store.popoverShown = false
+        return true
+    }
+
+    // Immediate close (no animation) for sleep, lock and display changes.
+    private func dismissPopover() {
+        reopenAfterClose = false
+        if popover.isShown { popover.close() }
+        clearOrphanedPopover()
+        store.popoverShown = false
+    }
+
     @objc private func togglePopover() {
+        if clearOrphanedPopover() { return }
         if popover.isShown {
             // Clicked away, then straight back on the bar mid-fade: reopen
             // once the close lands instead of swallowing the click.
@@ -664,6 +723,10 @@ extension AppDelegate: NSWindowDelegate {
 // window, and afterwards AppKit left the popover's own window at alpha 0 —
 // every later click showed it invisibly and it closed itself.
 extension AppDelegate: NSPopoverDelegate {
+    func popoverWillShow(_ notification: Notification) {
+        store.popoverShown = true
+    }
+
     func popoverDidShow(_ notification: Notification) {
         // Belt and braces: never leave a shown popover transparent.
         if let w = popover.contentViewController?.view.window, w.alphaValue < 1 {
@@ -676,6 +739,7 @@ extension AppDelegate: NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        store.popoverShown = false
         popoverClosedAt = Date()
         popoverClosing = false
         closedByOutsideClick = false
@@ -686,6 +750,10 @@ extension AppDelegate: NSPopoverDelegate {
         }
     }
 }
+
+// MeowBar talks to child processes over pipes; a write to one that just
+// died must surface as an error, not kill the app (SIGPIPE's default).
+signal(SIGPIPE, SIG_IGN)
 
 // `MeowBar --json` prints the last-good numbers and exits (no UI).
 if CommandLine.arguments.contains("--json") {

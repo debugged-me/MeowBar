@@ -64,6 +64,19 @@ extension ProviderUsage {
         return session?.resetsAt ?? weekly?.resetsAt
     }
 
+    // A transient failure (rate limit, network, server hiccup — anything
+    // without a fix-it action) keeps the last good numbers, marked stale, for
+    // up to 6h instead of flashing an error. Sign-in problems still show.
+    static func merge(_ new: ProviderUsage, over old: ProviderUsage, now: Date = Date()) -> ProviderUsage {
+        if !new.hasData, new.action == nil, old.hasData,
+           now.timeIntervalSince(old.fetchedAt) < 6 * 3600 {
+            var kept = old.normalized(now: now)
+            kept.isStale = true
+            return kept
+        }
+        return new.normalized(now: now)
+    }
+
     // Copy with every window brought up to date (see UsageWindow.normalized).
     func normalized(now: Date = Date()) -> ProviderUsage {
         var u = self
