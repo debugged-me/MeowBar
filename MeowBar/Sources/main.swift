@@ -296,23 +296,22 @@ final class UsageStore: ObservableObject {
     // Loaded once — the menu title is rebuilt every 2s.
     private var iconCache: [String: NSImage] = [:]
 
-    private func iconImage(_ resource: String, dimmed: Bool = false) -> NSImage? {
-        let key = dimmed ? "\(resource)-dim" : resource
-        if let img = iconCache[key] { return img }
+    private func iconImage(_ resource: String) -> NSImage? {
+        if let img = iconCache[resource] { return img }
         guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
-              let base = NSImage(contentsOf: url) else { return nil }
-        let img: NSImage
-        if dimmed {
-            // Stale data reads at half strength — ambient "not fresh" signal.
-            img = NSImage(size: base.size, flipped: false) { r in
-                base.draw(in: r, from: .zero, operation: .sourceOver, fraction: 0.5)
-                return true
-            }
-        } else {
-            img = base
-        }
+              let img = NSImage(contentsOf: url) else { return nil }
         img.size = NSSize(width: 16, height: 16)
-        iconCache[key] = img
+        iconCache[resource] = img
+        return img
+    }
+
+    // The app badge — used where the cat silhouette reads too muddy at
+    // menu-bar size (compact mode, the trot bob).
+    private func appBadgeImage() -> NSImage? {
+        if let img = iconCache["appbadge"] { return img }
+        guard let img = NSApp.applicationIconImage?.copy() as? NSImage else { return nil }
+        img.size = NSSize(width: 16, height: 16)
+        iconCache["appbadge"] = img
         return img
     }
 
@@ -328,16 +327,13 @@ final class UsageStore: ObservableObject {
             catY = trotPhase ? -3.4 : -2.2
         }
 
-        // Compact mode: one cat silhouette tinted by the worst window,
-        // then each provider's % left in small type — the minimal readout.
+        // Compact mode: the app badge, then each provider's % left in
+        // small type — the minimal readout. Severity lives in the numbers.
         if ud.bool(forKey: "meowbar.compact") {
-            let worst = [claude, codex, devin].compactMap(\.worstUsed).max()
-            let catColor: NSColor = worst == nil ? .secondaryLabelColor
-                : worst! >= 90 ? .systemRed : worst! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             let att = NSTextAttachment()
-            att.image = CatGlyph.tinted(size: 16, catColor)
-            att.bounds = CGRect(x: 0, y: catY, width: 16, height: 14.7)
+            att.image = appBadgeImage()
+            att.bounds = CGRect(x: 0, y: catY, width: 16, height: 16)
             s.append(NSAttributedString(attachment: att))
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
@@ -365,7 +361,7 @@ final class UsageStore: ObservableObject {
             let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
-            if let img = iconImage(resource, dimmed: stale) {
+            if let img = iconImage(resource) {
                 let att = NSTextAttachment()
                 att.image = img
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
@@ -420,20 +416,19 @@ final class UsageStore: ObservableObject {
         }
         let t = NSMutableAttributedString()
         if trotting {
-            // The trot: a cat head bobs beside the numbers while agents work.
+            // The trot: the app badge bobs beside the numbers while
+            // agents work — a silhouette reads too muddy at this size.
             let att = NSTextAttachment()
-            att.image = CatGlyph.tinted(size: 15, .labelColor)
-            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 13.8)
+            att.image = appBadgeImage()
+            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 15)
             t.append(NSAttributedString(attachment: att))
             t.append(NSAttributedString(string: "  "))
         }
         t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
-                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning,
-                       claude.isStale))
+                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
         t.append(NSAttributedString(string: "   "))
         t.append(entry("codex", "Codex", codex.displayLeft, codex.worstUsed,
-                       codex.displayReset, codex.displayTimeToEmpty, codexRunning,
-                       codex.isStale))
+                       codex.displayReset, codex.displayTimeToEmpty, codexRunning))
         return t
     }
 

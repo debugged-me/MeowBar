@@ -47,8 +47,8 @@ struct SettingsView: View {
                 }
                 Toggle(isOn: $compact) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Compact — cat and small percentages")
-                        Text("A cat tinted by your worst window plus each provider's % left in small type — the minimal readout.")
+                        Text("Compact — icon and small percentages")
+                        Text("The MeowBar badge plus each provider's % left in small type — the minimal readout.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
