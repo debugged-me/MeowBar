@@ -307,7 +307,7 @@ final class UsageStore: ObservableObject {
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
         func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
-                   _ resetAt: Date?, _ running: Bool) -> NSAttributedString {
+                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool) -> NSAttributedString {
             let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
@@ -320,9 +320,14 @@ final class UsageStore: ObservableObject {
 
             let mode = UserDefaults.standard.string(forKey: "meowbar.displayMode") ?? "percent"
             let metric: String
-            if mode == "countdown", let reset = resetAt {
-                metric = Countdown.compact(to: reset)
-            } else {
+            switch mode {
+            case "countdown" where resetAt != nil:
+                metric = Countdown.compact(to: resetAt!)
+            case "eta" where eta != nil:
+                metric = "~" + Countdown.compact(to: Date().addingTimeInterval(eta!))
+            case "eta" where resetAt != nil:
+                metric = Countdown.compact(to: resetAt!)
+            default:
                 metric = pct.map { String(format: "%.0f%%", $0) } ?? "–"
             }
             s.append(NSAttributedString(
@@ -361,10 +366,10 @@ final class UsageStore: ObservableObject {
         }
         let t = NSMutableAttributedString()
         t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
-                       claude.displayReset, claudeRunning))
+                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
         t.append(NSAttributedString(string: "   "))
         t.append(entry("codex", "Codex", codex.displayLeft, codex.worstUsed,
-                       codex.displayReset, codexRunning))
+                       codex.displayReset, codex.displayTimeToEmpty, codexRunning))
         return t
     }
 
@@ -408,8 +413,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "🐱"
         statusItem.button?.toolTip = "Claude / Codex usage"
-        statusItem.button?.action = #selector(togglePopover)
+        statusItem.button?.action = #selector(statusItemClicked)
         statusItem.button?.target = self
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         popover.behavior = .semitransient
         popover.delegate = self
@@ -627,6 +633,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let bg = IslandView()
             bg.onClick = { [weak self] in self?.togglePopover() }
+            bg.onRightClick = { [weak self] in
+                guard let self else { return }
+                self.dismissPopover()
+                self.showStatusMenu(in: self.islandPanel?.contentView)
+            }
             let tf = NSTextField(labelWithAttributedString: NSAttributedString())
             tf.drawsBackground = false
             bg.addSubview(tf)
@@ -641,19 +652,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func layoutIsland() {
         guard let p = islandPanel, let tf = islandField,
               let screen = NSScreen.main, p.isVisible else { return }
+        let bg = p.contentView as? IslandView
         let title = store.menuTitle
         tf.attributedStringValue = title
         tf.sizeToFit() // attributed .size() under-measures image attachments
         let sz = tf.fittingSize
-        let pad: CGFloat = 12, h: CGFloat = 26
-        let w = sz.width + pad * 2
+        let pad: CGFloat = 12, h: CGFloat = 26, catPad: CGFloat = 17
+        let w = sz.width + pad * 2 + catPad
         // Hang just below the notch/menu area: safeAreaInsets.top covers the
         // notch on modern MacBooks, 0 elsewhere (sits flush at top edge).
         let drop = screen.safeAreaInsets.top
         let y = screen.frame.maxY - drop - h - 2
         p.setFrame(NSRect(x: screen.frame.midX - w / 2, y: y, width: w, height: h),
                    display: true)
-        tf.frame = NSRect(x: pad, y: 3, width: sz.width, height: h - 6)
+        tf.frame = NSRect(x: pad + catPad, y: 3, width: sz.width, height: h - 6)
+        bg?.showCat(true)
+        bg?.setSeverity([store.claude, store.codex, store.devin].compactMap(\.worstUsed).max())
     }
 
     private var popoverWindow: NSWindow? { popover.contentViewController?.view.window }
@@ -674,6 +688,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown { popover.close() }
         clearOrphanedPopover()
         store.popoverShown = false
+    }
+
+    // Left click toggles the popover; right click gets the classic menu —
+    // same items as the gear menu, for people who never open the popover.
+    @objc private func statusItemClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            dismissPopover()
+            showStatusMenu(in: statusItem.button)
+            return
+        }
+        togglePopover()
+    }
+
+    private func showStatusMenu(in view: NSView?) {
+        guard let view else { return }
+        let menu = NSMenu()
+        func item(_ title: String, _ action: Selector) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            i.target = self
+            return i
+        }
+        let head = NSMenuItem(title: "MeowBar \(UpdateCheck.currentVersion)",
+                              action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        menu.addItem(head)
+        menu.addItem(.separator())
+        menu.addItem(item("Refresh Now", #selector(menuRefresh)))
+        menu.addItem(item("Settings…", #selector(menuSettings)))
+        if let update = store.update, UpdateCheck.downloadURL(update) != nil {
+            menu.addItem(.separator())
+            menu.addItem(item("Download MeowBar \(update.version)…", #selector(menuDownloadUpdate)))
+        } else if UpdateCheck.feedURL != nil {
+            menu.addItem(item("Check for Updates…", #selector(menuCheckUpdates)))
+        }
+        menu.addItem(.separator())
+        menu.addItem(item("Quit MeowBar", #selector(menuQuit)))
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: view)
+    }
+
+    @objc private func menuRefresh() { store.refresh() }
+    @objc private func menuSettings() { openSettings() }
+    @objc private func menuQuit() { NSApp.terminate(nil) }
+    @objc private func menuCheckUpdates() { store.checkForUpdate() }
+    @objc private func menuDownloadUpdate() {
+        guard let update = store.update, let url = UpdateCheck.downloadURL(update) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func togglePopover() {
@@ -733,6 +793,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // hover, click opens the popover.
 private final class IslandView: NSVisualEffectView {
     var onClick: (() -> Void)?
+    var onRightClick: (() -> Void)?
+    // A hairline under the text tinted by the worst window across providers:
+    // the island alone tells you someone is near a limit.
+    private let severityBar = NSView()
+    private var catView: NSImageView?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -745,15 +810,51 @@ private final class IslandView: NSVisualEffectView {
         addTrackingArea(NSTrackingArea(rect: .zero,
                                        options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
+        severityBar.wantsLayer = true
+        severityBar.layer?.cornerRadius = 1
+        severityBar.isHidden = true
+        addSubview(severityBar)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // severity: worst used% across providers (nil → hide the line).
+    func setSeverity(_ worst: Double?) {
+        guard let worst else {
+            severityBar.isHidden = true
+            return
+        }
+        severityBar.isHidden = false
+        severityBar.layer?.backgroundColor = (worst >= 90 ? NSColor.systemRed
+            : worst >= 75 ? NSColor.systemOrange
+            : NSColor.labelColor.withAlphaComponent(0.35)).cgColor
+    }
+
+    // Cat mark at the island's leading edge, tinted like the text.
+    func showCat(_ show: Bool) {
+        if show && catView == nil {
+            let img = CatGlyph.image(size: 15)
+            let iv = NSImageView(image: img)
+            iv.contentTintColor = .secondaryLabelColor
+            addSubview(iv)
+            catView = iv
+        }
+        catView?.isHidden = !show
+    }
+
+    override func layout() {
+        super.layout()
+        let h = bounds.height
+        severityBar.frame = NSRect(x: 10, y: 2.5, width: bounds.width - 20, height: 1.5)
+        if let catView { catView.frame = NSRect(x: 9, y: (h - 12) / 2, width: 14, height: 12) }
+    }
 
     override func mouseEntered(with event: NSEvent) { animator().alphaValue = 1.0 }
     override func mouseExited(with event: NSEvent) { animator().alphaValue = 0.85 }
     override func mouseUp(with event: NSEvent) {
         if event.clickCount == 1 { onClick?() }
     }
+    override func rightMouseUp(with event: NSEvent) { onRightClick?() }
 }
 
 extension AppDelegate: NSWindowDelegate {

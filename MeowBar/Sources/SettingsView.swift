@@ -32,6 +32,11 @@ struct SettingsView: View {
                 Picker("Show", selection: $displayMode) {
                     Text("% left").tag("percent")
                     Text("Time until reset").tag("countdown")
+                    Text("Time until empty").tag("eta")
+                }
+                if displayMode == "eta" {
+                    Text("Shows how long until the limit runs out at your current pace — ~2h means you'd hit it in about 2 hours. When you're not on pace to run out, it falls back to the reset countdown.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 

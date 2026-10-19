@@ -64,6 +64,19 @@ enum UsageHistory {
         return totals
     }
 
+    // Burn per hour over the last `hours` (oldest first, current hour last) —
+    // the sparkline's data.
+    static func hourlyBurn(_ samples: [UsageSample], hours: Int = 24,
+                           now: Date = Date()) -> [Double] {
+        var totals = [Double](repeating: 0, count: hours)
+        for b in burns(samples) {
+            let ago = Int(now.timeIntervalSince(b.t) / 3600)
+            guard ago >= 0, ago < hours else { continue }
+            totals[hours - 1 - ago] += b.points
+        }
+        return totals
+    }
+
     // Start hour of the busiest 3-hour block of the day, or nil until there's
     // enough signal to say anything (≥ 3 points burned in total).
     static func busiestBlock(_ samples: [UsageSample], calendar: Calendar = .current) -> Int? {

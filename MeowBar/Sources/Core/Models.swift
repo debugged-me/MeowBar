@@ -64,6 +64,32 @@ extension ProviderUsage {
         return session?.resetsAt ?? weekly?.resetsAt
     }
 
+    // Same window selection, for the "time to empty" display mode.
+    var displayTimeToEmpty: TimeInterval? {
+        if let w = weekly, w.usedPercent >= 90 { return w.timeToEmpty() }
+        return (session ?? weekly)?.timeToEmpty()
+    }
+
+    // One-line summary for copying, e.g. "Claude: session 31% left · weekly
+    // 85% left · resets in 2h 5m". Falls back to the plan note or the error.
+    func shareLine(now: Date = Date()) -> String {
+        var parts: [String] = []
+        if let s = session {
+            parts.append("\(name == "Devin" ? "daily" : "session") \(Int(max(0, 100 - s.usedPercent)))% left")
+        }
+        if let w = weekly {
+            parts.append("weekly \(Int(max(0, 100 - w.usedPercent)))% left")
+        }
+        if parts.isEmpty {
+            if let noteAccent { return "\(name): \([note, noteAccent].compactMap { $0 }.joined(separator: " "))" }
+            return "\(name): " + (error ?? "no data")
+        }
+        if let reset = session?.resetsAt ?? weekly?.resetsAt, reset > now {
+            parts.append("resets in \(Countdown.compact(to: reset, now: now))")
+        }
+        return "\(name): " + parts.joined(separator: " · ")
+    }
+
     // A transient failure (rate limit, network, server hiccup — anything
     // without a fix-it action) keeps the last good numbers, marked stale, for
     // up to 6h instead of flashing an error. Sign-in problems still show.
@@ -124,19 +150,32 @@ extension UsageWindow {
     // short verdict + how alarming it is. Silent until there's signal: 10%
     // of the window gone (30 min of a 5h window, ~17h of a week) unless usage
     // is already high — 3h into a week says little about Friday.
+    // Seconds until the window hits 100% at the current burn pace — nil when
+    // there's no signal yet or the pace won't max it out before reset. Same
+    // gates as the pace verdict, so the number never appears without one.
+    func timeToEmpty(now: Date = Date()) -> TimeInterval? {
+        guard let win = windowSeconds, let reset = resetsAt,
+              usedPercent > 0, usedPercent < 100 else { return nil }
+        let remaining = reset.timeIntervalSince(now)
+        let elapsed = win - remaining
+        guard elapsed > 600, elapsed >= win * 0.1 || usedPercent >= 30 else { return nil }
+        let usedFrac = usedPercent / 100
+        guard usedFrac * win / elapsed >= 1 else { return nil }
+        let secondsToFull = (1 - usedFrac) * elapsed / usedFrac
+        return secondsToFull < remaining ? secondsToFull : nil
+    }
+
     private func pace(now: Date) -> (verdict: String, severity: PaceSeverity) {
         guard let win = windowSeconds, let reset = resetsAt else { return ("", .none) }
         if usedPercent >= 100 { return ("maxed", .bad) }
         let remaining = reset.timeIntervalSince(now)
         let elapsed = win - remaining
         guard elapsed > 600, elapsed >= win * 0.1 || usedPercent >= 30 else { return ("", .none) }
-        let usedFrac = usedPercent / 100
-        let projected = usedFrac * win / elapsed
-        if projected >= 1 {
-            let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
-            guard secondsToFull < remaining else { return ("cutting it close", .warn) }
-            return ("may run out in ~\(Countdown.rough(secondsToFull))", .bad)
+        let projected = usedPercent / 100 * win / elapsed
+        if let toEmpty = timeToEmpty(now: now) {
+            return ("may run out in ~\(Countdown.rough(toEmpty))", .bad)
         }
+        if projected >= 1 { return ("cutting it close", .warn) }
         if projected < 0.55 { return ("plenty left", .good) }
         if projected < 0.85 { return ("comfortable", .ok) }
         return ("cutting it close", .warn)

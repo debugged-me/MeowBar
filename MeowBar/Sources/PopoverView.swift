@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // Derive from the semantic foreground instead of a fixed gray. It remains
 // legible when the glass moves over light, dark, or tinted UI.
@@ -303,6 +304,12 @@ struct ProviderBlock: View {
                 WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
+        .contextMenu {
+            Button("Copy usage") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(usage.shareLine(), forType: .string)
+            }
+        }
         .opacity(appeared ? 1 : 0)
         .offset(y: appeared ? 0 : 5)
         .onAppear { if store?.popoverShown ?? true { replayEntrance() } else { appeared = true } }
@@ -366,37 +373,80 @@ struct HistoryStrip: View {
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(supportingText(colorScheme))
         } else {
-            HStack(alignment: .bottom, spacing: 10) {
-                HStack(alignment: .bottom, spacing: 3) {
-                    ForEach(Array(days.enumerated()), id: \.offset) { i, v in
-                        Capsule()
-                            .fill(tint.opacity(i == days.count - 1 ? 1 : 0.5))
-                            .frame(width: 7, height: max(2, 22 * v / peak))
-                            .help("\(dayLabel(i, of: days.count)) · \(Int(v.rounded()))% of the \(unit) limit")
-                    }
-                }
-                .frame(height: 22, alignment: .bottom)
-                Spacer()
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text("last 7 days")
-                    if days.count >= 2 {
-                        let delta = (days.last ?? 0) - days[days.count - 2]
-                        if abs(delta) >= 3 {
-                            Text("\(delta > 0 ? "↑" : "↓")\(Int(abs(delta).rounded()))% today")
-                                .help("Points of the \(unit) limit burned today vs. yesterday")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .bottom, spacing: 10) {
+                    HStack(alignment: .bottom, spacing: 3) {
+                        ForEach(Array(days.enumerated()), id: \.offset) { i, v in
+                            Capsule()
+                                .fill(tint.opacity(i == days.count - 1 ? 1 : 0.5))
+                                .frame(width: 7, height: max(2, 22 * v / peak))
+                                .help("\(dayLabel(i, of: days.count)) · \(Int(v.rounded()))% of the \(unit) limit")
                         }
                     }
-                    if let b = UsageHistory.busiestBlock(samples) {
-                        Text("busiest \(UsageHistory.blockLabel(startHour: b))")
+                    .frame(height: 22, alignment: .bottom)
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text("last 7 days")
+                        if days.count >= 2 {
+                            let delta = (days.last ?? 0) - days[days.count - 2]
+                            if abs(delta) >= 3 {
+                                Text("\(delta > 0 ? "↑" : "↓")\(Int(abs(delta).rounded()))% today")
+                                    .help("Points of the \(unit) limit burned today vs. yesterday")
+                            }
+                        }
+                        if let b = UsageHistory.busiestBlock(samples) {
+                            Text("busiest \(UsageHistory.blockLabel(startHour: b))")
+                        }
                     }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(supportingText(colorScheme))
                 }
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(supportingText(colorScheme))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Last 7 days: " + days.enumerated()
+                    .map { "\(dayLabel($0.offset, of: days.count)) \(Int($0.element.rounded())) percent" }
+                    .joined(separator: ", "))
+
+                // Hour-by-hour burn over the last day — when the spend
+                // happened, not just how much.
+                let hours = UsageHistory.hourlyBurn(samples)
+                if hours.contains(where: { $0 > 0 }) {
+                    Sparkline(values: hours, tint: tint)
+                        .frame(height: 16)
+                        .help("Burn per hour over the last 24 hours")
+                }
             }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Last 7 days: " + days.enumerated()
-                .map { "\(dayLabel($0.offset, of: days.count)) \(Int($0.element.rounded())) percent" }
-                .joined(separator: ", "))
+        }
+    }
+}
+
+// A thin line chart — used for the last-24h burn inside expanded history.
+private struct Sparkline: View {
+    let values: [Double]
+    var tint: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            let peak = max(values.max() ?? 0, 0.001)
+            let stepX = w / max(1, CGFloat(values.count - 1))
+            let pts = values.enumerated().map { i, v in
+                CGPoint(x: CGFloat(i) * stepX,
+                        y: h - 1.5 - (h - 3) * CGFloat(v / peak))
+            }
+            Path { p in
+                guard let first = pts.first else { return }
+                p.move(to: CGPoint(x: first.x, y: h - 1))
+                for pt in pts { p.addLine(to: pt) }
+                p.addLine(to: CGPoint(x: pts.last?.x ?? first.x, y: h - 1))
+                p.closeSubpath()
+            }
+            .fill(tint.opacity(0.18))
+            Path { p in
+                guard let first = pts.first else { return }
+                p.move(to: first)
+                for pt in pts.dropFirst() { p.addLine(to: pt) }
+            }
+            .stroke(tint.opacity(0.9), lineWidth: 1.2)
         }
     }
 }

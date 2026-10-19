@@ -32,7 +32,8 @@ those numbers where they belong: always visible, always fresh, zero setup.
 - **Auto-started session clock** — Claude's 5-hour window only opens on your
   first message; when it's idle and you're at your Mac, MeowBar opens it with
   a one-word Haiku prompt so the reset comes sooner (Settings → Claude)
-- **History** — click a provider's name for its last 7 days and busiest hours,
+- **History** — click a provider's name for its last 7 days, busiest hours,
+  and a 24h burn sparkline; right-click a provider to copy a one-line summary,
   kept locally for 8 days
 - **Never blank** — last-good numbers are cached on disk; a relaunch or rate
   limit shows them (with their age) instead of an error, and repeated 429s
@@ -49,7 +50,10 @@ those numbers where they belong: always visible, always fresh, zero setup.
   bars in brand colors, reset countdowns
 - **Positions** — sit on the right with the other icons or float center-top as
   an "island" under the notch (Settings → Position)
-- **Display modes** — % left or countdown-to-reset in the bar
+- **Display modes** — % left, countdown-to-reset, or time-until-empty
+  (pace-projected) in the bar
+- **Right-click** — the bar item gets a menu (Refresh, Settings, Quit) like a
+  proper Mac citizen
 - **Optional third provider** — Devin quota when the Devin IDE is signed in;
   hidden entirely otherwise
 - **Configurable alerts** — macOS notifications at 75 / 90 / 95% and on window

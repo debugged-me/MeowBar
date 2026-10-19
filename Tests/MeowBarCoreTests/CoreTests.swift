@@ -78,6 +78,19 @@ final class WindowTests: XCTestCase {
         XCTAssertEqual(UsageWindow(usedPercent: 50, resetsAt: later, windowSeconds: 604800).paceVerdict(now: now), "may run out in ~2d")
     }
 
+    func testTimeToEmpty() {
+        // 1h into a 5h window at 40%: burns 40%/h → 100% in 1.5h, before reset.
+        let reset = now.addingTimeInterval(4 * 3600)
+        XCTAssertEqual(UsageWindow(usedPercent: 40, resetsAt: reset, windowSeconds: 18000)
+            .timeToEmpty(now: now)!, 5400, accuracy: 1)
+        // On pace to finish the window under the limit → no empty date.
+        XCTAssertNil(UsageWindow(usedPercent: 10, resetsAt: reset, windowSeconds: 18000).timeToEmpty(now: now))
+        // Already maxed, or too little signal → nil (the verdict covers these).
+        XCTAssertNil(UsageWindow(usedPercent: 100, resetsAt: reset, windowSeconds: 18000).timeToEmpty(now: now))
+        let early = now.addingTimeInterval(18000 - 300)
+        XCTAssertNil(UsageWindow(usedPercent: 5, resetsAt: early, windowSeconds: 18000).timeToEmpty(now: now))
+    }
+
     func testRoughDurations() {
         XCTAssertEqual(Countdown.rough(60), "5m")
         XCTAssertEqual(Countdown.rough(33 * 60), "35m")
@@ -96,6 +109,19 @@ final class ProviderTests: XCTestCase {
         u.weekly = UsageWindow(usedPercent: 95)
         XCTAssertEqual(u.displayLeft, 5)
         XCTAssertEqual(u.worstUsed, 95)
+    }
+
+    func testShareLine() {
+        var u = ProviderUsage(name: "Claude")
+        u.session = UsageWindow(usedPercent: 69, resetsAt: now.addingTimeInterval(4 * 3600 + 59 * 60),
+                                windowSeconds: 18000)
+        u.weekly = UsageWindow(usedPercent: 15)
+        XCTAssertEqual(u.shareLine(now: now), "Claude: session 31% left · weekly 85% left · resets in 4h59m")
+
+        var plan = ProviderUsage(name: "Devin")
+        plan.note = "Pro"; plan.noteAccent = "unlimited"
+        XCTAssertEqual(plan.shareLine(now: now), "Devin: Pro unlimited")
+        XCTAssertEqual(ProviderUsage(name: "Codex").shareLine(now: now), "Codex: no data")
     }
 
     func testCacheRoundTripDropsPerFetchState() throws {
@@ -183,6 +209,21 @@ final class HistoryTests: XCTestCase {
             UsageSample(t: at(19, 10), session: 25, weekly: nil),
         ]
         XCTAssertEqual(UsageHistory.dailyBurn(samples, days: 1, now: at(19, 20), calendar: utc), [15])
+    }
+
+    func testHourlyBurn() {
+        let samples = [
+            UsageSample(t: at(17, 10), session: 0, weekly: 1),  // old anchor outside the window
+            UsageSample(t: at(19, 9), session: 0, weekly: 10),  // +9 lands at 11h ago
+            UsageSample(t: at(19, 10), session: 0, weekly: 25), // +15 at 10h ago
+            UsageSample(t: at(19, 19), session: 0, weekly: 28), // +3 at 1h ago
+        ]
+        let hours = UsageHistory.hourlyBurn(samples, hours: 24, now: at(19, 20))
+        XCTAssertEqual(hours.count, 24)
+        XCTAssertEqual(hours[12], 9)   // 11 hours ago
+        XCTAssertEqual(hours[13], 15)  // 10 hours ago
+        XCTAssertEqual(hours[22], 3)   // 1 hour ago
+        XCTAssertEqual(hours.reduce(0, +), 27)
     }
 
     func testBusiestBlock() {

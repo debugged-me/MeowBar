@@ -36,5 +36,12 @@ enum PopoverShot {
             popover.show(relativeTo: v.bounds, of: v, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+
+        // MEOWBAR_EXPAND=1 expands the nth provider (history + sparkline).
+        if let which = ProcessInfo.processInfo.environment["MEOWBAR_EXPAND"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                NotificationCenter.default.post(name: .init("meowbar.toggleProvider"), object: which)
+            }
+        }
     }
 }

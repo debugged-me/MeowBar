@@ -36,13 +36,37 @@ else
 fi
 echo "Built $APP ($VERSION, signed: $SIGN_ID)"
 
-# Distributable DMG: app + /Applications symlink for drag-install
-STAGING=$(mktemp -d)
+# Distributable DMG: app + /Applications symlink for drag-install.
+# Finder records the installer window's layout in the staging folder's
+# .DS_Store before imaging — no mounting required, and it's carried into
+# the image wholesale. All best-effort: cosmetics never fail the build.
+STAGING=$(mktemp -d)/MeowBar
+mkdir -p "$STAGING"
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
+
+osascript 2>/dev/null <<FEOF || true
+tell application "Finder"
+    set f to POSIX file "$STAGING" as alias
+    set w to make new Finder window to f
+    set current view of w to icon view
+    set toolbar visible of w to false
+    set statusbar visible of w to false
+    set bounds of w to {200, 120, 680, 360}
+    set vo to icon view options of w
+    set arrangement of vo to not arranged
+    set icon size of vo to 88
+    set position of item "MeowBar.app" of f to {130, 115}
+    set position of item "Applications" of f to {335, 115}
+    update f
+    delay 0.5
+    close w
+end tell
+FEOF
+
 rm -f build/MeowBar.dmg
 hdiutil create -volname "MeowBar" -srcfolder "$STAGING" -ov -format UDZO build/MeowBar.dmg >/dev/null
-rm -rf "$STAGING"
+rm -rf "$(dirname "$STAGING")"
 
 if [ "$SIGN_ID" != "-" ]; then
     codesign --force --timestamp --sign "$SIGN_ID" build/MeowBar.dmg
