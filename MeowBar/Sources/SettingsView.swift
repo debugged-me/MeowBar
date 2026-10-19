@@ -24,7 +24,10 @@ struct SettingsView: View {
     @State private var checkingUpdate = false
 
     var body: some View {
-        Form {
+        // ScrollView + cap: the form grew past smaller screens' height —
+        // it scrolls instead of clipping the bottom off-screen.
+        ScrollView {
+            Form {
             Section("Menu bar") {
                 Picker("Position", selection: $position) {
                     Text("Right — with the other icons").tag("right")
@@ -116,10 +119,12 @@ struct SettingsView: View {
                 }
             }
         }
-        .formStyle(.grouped)
-        .padding(4)
+            .formStyle(.grouped)
+            .padding(4)
+        }
+        .scrollContentBackground(.hidden)
         .frame(width: 420)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxHeight: 620)
         .onAppear {
             bridgeInstalled = StatuslineBridge.isInstalled
             alwaysFresh = bridgeInstalled // reflect real state, even if enabled elsewhere

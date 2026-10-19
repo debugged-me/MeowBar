@@ -462,6 +462,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["MEOWBAR_POPOVER_SHOT"] != nil {
             PopoverShot.show()
         }
+        // Sound test: MEOWBAR_MEOW=1 plays once through the real code path
+        // (needs the Settings toggle on, like a real reset).
+        if ProcessInfo.processInfo.environment["MEOWBAR_MEOW"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MeowSound.play() }
+        }
         NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applyPosition()
