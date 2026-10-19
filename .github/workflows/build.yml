@@ -1,0 +1,24 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    # The popover uses macOS 26 APIs behind #available, so it needs the
+    # macOS 26 SDK (Xcode 26) to compile.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: swift test
+      - name: Build app + DMG
+        run: ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeowBar
+          path: |
+            build/MeowBar.dmg
+            build/version.json

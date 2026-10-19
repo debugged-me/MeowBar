@@ -6,3 +6,5 @@ build/
 .LSOverride
 Thumbs.db
 Desktop.ini
+/version.json
+.build/

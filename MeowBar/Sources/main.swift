@@ -1,5 +1,6 @@
 import Cocoa
 import QuartzCore
+import ServiceManagement
 import SwiftUI
 
 final class UsageStore: ObservableObject {
@@ -10,10 +11,15 @@ final class UsageStore: ObservableObject {
     @Published var codexRunning = false
     @Published var devinRunning = false
     @Published var lastUpdated: Date?
+    @Published var history: [String: [UsageSample]] = [:]
+    @Published var clockStarting = false
+    @Published var update: UpdateInfo?
     var onUpdate: (() -> Void)?
     var onAlert: (() -> Void)?
     private var timer: Timer?
     private var activityTimer: Timer?
+    private var updateTimer: Timer?
+    private var lastClockAttempt: Date?
     private var activityCheckInFlight = false
     // Transient menu-bar alerts: armed on state edges (task finished, limit
     // reached), auto-clear after alertTTL or instantly on click.
@@ -31,13 +37,41 @@ final class UsageStore: ObservableObject {
 
     func start() {
         if injectDemo() { return }
+        loadCache()
         refresh()
         sampleActivity()
+        checkForUpdate()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         activityTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.sampleActivity()
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in
+            self?.checkForUpdate()
+        }
+    }
+
+    // Last run's numbers, shown (marked stale) until the first fetch lands.
+    private func loadCache() {
+        for var u in AppFiles.load([ProviderUsage].self, from: AppFiles.usageCache) ?? [] {
+            u = u.normalized()
+            u.isStale = true
+            switch u.name {
+            case "Claude": claude = u
+            case "Codex": codex = u
+            case "Devin": devin = u
+            default: break
+            }
+        }
+        history = AppFiles.load([String: [UsageSample]].self, from: AppFiles.history) ?? [:]
+        onUpdate?()
+    }
+
+    private func checkForUpdate() {
+        Task {
+            let info = await UpdateCheck.check()
+            await MainActor.run { self.update = info }
         }
     }
 
@@ -54,6 +88,18 @@ final class UsageStore: ObservableObject {
         codex.session = win(14, 2.1 * 3600, 18000)
         codex.weekly = win(45, 5.2 * 86400, 604800)
         devin.note = "Pro"; devin.noteAccent = "unlimited"
+        // A week of afternoon-heavy history for the expanded view.
+        for (name, scale) in [("Claude", 1.0), ("Codex", 0.6)] {
+            var samples: [UsageSample] = [], w = 0.0
+            for i in stride(from: 7 * 24, through: 0, by: -1) {
+                let t = now.addingTimeInterval(-Double(i) * 3600)
+                let hour = Calendar.current.component(.hour, from: t)
+                let busy = (13...17).contains(hour) ? 1.6 : (9...12).contains(hour) ? 0.7 : 0.05
+                w += busy * scale * (1 + 0.5 * sin(Double(i) / 9))
+                samples.append(UsageSample(t: t, session: nil, weekly: min(w, 100)))
+            }
+            history[name] = samples
+        }
         if mode == "alerts" {
             claude.session = win(96, 0.8 * 3600, 18000)
             claude.weekly = win(100, 3.7 * 86400, 604800)
@@ -74,28 +120,94 @@ final class UsageStore: ObservableObject {
             async let d = UsageService.fetchDevin()
             let (cl, co, dv) = await (c, x, d)
             await MainActor.run {
-                self.claude = cl
-                self.codex = co
-                self.devin = dv
-                self.lastUpdated = Date()
                 let now = Date()
-                for s in [(name: "Claude", pct: Self.dispLeft(cl), worst: Self.worstUsed(cl)),
-                          (name: "Codex", pct: Self.dispLeft(co), worst: Self.worstUsed(co)),
-                          (name: "Devin", pct: Self.dispLeft(dv), worst: Self.worstUsed(dv))] {
-                    let prevW = self.prevWorst[s.name] ?? -1
-                    if let w = s.worst { self.prevWorst[s.name] = w }
-                    if let w = s.worst, w >= 90, prevW < 90 {
-                        self.arm(s.name, (s.pct ?? 0) <= 0 ? "limit reached" : "nearing limit", now: now)
-                    } else if (s.pct ?? 1) <= 0, self.alertText[s.name] == "nearing limit" {
-                        self.arm(s.name, "limit reached", now: now)
+                self.claude = self.withClock(Self.merge(cl, over: self.claude, now: now), now: now)
+                self.codex = Self.merge(co, over: self.codex, now: now)
+                self.devin = Self.merge(dv, over: self.devin, now: now)
+                self.lastUpdated = now
+                for u in [self.claude, self.codex, self.devin] {
+                    let pct = u.displayLeft, worst = u.worstUsed
+                    let prevW = self.prevWorst[u.name] ?? -1
+                    if let w = worst { self.prevWorst[u.name] = w }
+                    if let w = worst, w >= 90, prevW < 90 {
+                        self.arm(u.name, (pct ?? 0) <= 0 ? "limit reached" : "nearing limit", now: now)
+                    } else if (pct ?? 1) <= 0, self.alertText[u.name] == "nearing limit" {
+                        self.arm(u.name, "limit reached", now: now)
                     }
                 }
-                Notifier.evaluate(cl)
-                Notifier.evaluate(co)
-                Notifier.evaluate(dv)
+                Notifier.evaluate(self.claude, others: [self.codex])
+                Notifier.evaluate(self.codex, others: [self.claude])
+                Notifier.evaluate(self.devin)
+                self.persist(now: now)
+                self.maybeStartClock(now: now)
                 self.onUpdate?()
             }
         }
+    }
+
+    // A transient failure (rate limit, network, server hiccup — anything
+    // without a fix-it action) keeps the last good numbers, marked stale, for
+    // up to 6h instead of flashing an error. Sign-in problems still show.
+    static func merge(_ new: ProviderUsage, over old: ProviderUsage, now: Date) -> ProviderUsage {
+        if !new.hasData, new.action == nil, old.hasData,
+           now.timeIntervalSince(old.fetchedAt) < 6 * 3600 {
+            var kept = old.normalized(now: now)
+            kept.isStale = true
+            return kept
+        }
+        return new.normalized(now: now)
+    }
+
+    private func persist(now: Date) {
+        let visible = [claude, codex, devin].filter(\.isVisible)
+        if !visible.isEmpty { AppFiles.save(visible, to: AppFiles.usageCache) }
+        var changed = false
+        for u in visible where u.hasData && !u.isStale {
+            let sample = UsageSample(t: now, session: u.session?.usedPercent, weekly: u.weekly?.usedPercent)
+            if UsageHistory.append(sample, to: &history[u.name, default: []]) { changed = true }
+        }
+        if changed { AppFiles.save(history, to: AppFiles.history) }
+    }
+
+    // MARK: Session clock
+
+    private var autoClockEnabled: Bool {
+        let d = UserDefaults.standard
+        return d.object(forKey: "meowbar.autoClock") == nil || d.bool(forKey: "meowbar.autoClock")
+    }
+
+    // Idle Claude session + you're at the Mac → open the 5h window now, so its
+    // reset comes sooner. Retried at most every 15 min.
+    private func maybeStartClock(now: Date) {
+        guard autoClockEnabled, !clockStarting, !demoActive,
+              SessionClock.shouldStart(session: claude.session, dataIsStale: claude.isStale,
+                                       userIdleSeconds: UserPresence.idleSeconds,
+                                       screenLocked: UserPresence.screenLocked,
+                                       running: claudeRunning, lastAttempt: lastClockAttempt, now: now)
+        else { return }
+        lastClockAttempt = now
+        clockStarting = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let ok = UsageService.startClaudeClock()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.clockStarting = false
+                if ok { UserDefaults.standard.set(Date(), forKey: "meowbar.clockStartedAt") }
+                self.refresh()
+            }
+        }
+    }
+
+    // After MeowBar opens the window the usage API can lag (or be rate-
+    // limited) — show the estimated reset until it reports the real one.
+    private func withClock(_ u: ProviderUsage, now: Date) -> ProviderUsage {
+        guard let started = UserDefaults.standard.object(forKey: "meowbar.clockStartedAt") as? Date,
+              SessionClock.isIdle(u.session, now: now) else { return u }
+        let reset = SessionClock.estimatedReset(startedAt: started)
+        guard reset > now else { return u }
+        var out = u
+        out.session?.resetsAt = reset
+        return out
     }
 
     private func sampleActivity() {
@@ -142,33 +254,6 @@ final class UsageStore: ObservableObject {
         return true
     }
 
-    static func worstUsed(_ u: ProviderUsage) -> Double? {
-        [u.session, u.weekly].compactMap { $0 }.map(\.usedPercent).max()
-    }
-
-    // Menu-bar number: weekly % left only when the weekly itself is the blocker
-    // (≥90% used); otherwise the session % left.
-    static func dispLeft(_ u: ProviderUsage) -> Double? {
-        let s = u.session?.usedPercent, w = u.weekly?.usedPercent
-        if let w, w >= 90 { return 100 - w }
-        return (s ?? w).map { 100 - $0 }
-    }
-
-    // The window the bar is displaying — same rule as dispLeft.
-    static func dispReset(_ u: ProviderUsage) -> Date? {
-        if let w = u.weekly, w.usedPercent >= 90 { return w.resetsAt }
-        return u.session?.resetsAt ?? u.weekly?.resetsAt
-    }
-
-    // "4h59m" / "6d10h" — compact for the countdown display mode.
-    static func compactCountdown(to date: Date) -> String {
-        let s = max(0, Int(date.timeIntervalSinceNow))
-        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
-        if d > 0 { return "\(d)d\(h)h" }
-        if h > 0 { return "\(h)h\(m)m" }
-        return "\(m)m"
-    }
-
     private func arm(_ name: String, _ text: String, now: Date) {
         alertText[name] = text
         alertUntil[name] = now.addingTimeInterval(alertTTL)
@@ -207,7 +292,7 @@ final class UsageStore: ObservableObject {
             let mode = UserDefaults.standard.string(forKey: "meowbar.displayMode") ?? "percent"
             let metric: String
             if mode == "countdown", let reset = resetAt {
-                metric = Self.compactCountdown(to: reset)
+                metric = Countdown.compact(to: reset)
             } else {
                 metric = pct.map { String(format: "%.0f%%", $0) } ?? "–"
             }
@@ -246,11 +331,11 @@ final class UsageStore: ObservableObject {
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("claude", "Claude", Self.dispLeft(claude), Self.worstUsed(claude),
-                       Self.dispReset(claude), claudeRunning))
+        t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
+                       claude.displayReset, claudeRunning))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", "Codex", Self.dispLeft(codex), Self.worstUsed(codex),
-                       Self.dispReset(codex), codexRunning))
+        t.append(entry("codex", "Codex", codex.displayLeft, codex.worstUsed,
+                       codex.displayReset, codexRunning))
         return t
     }
 
@@ -271,15 +356,22 @@ final class UsageStore: ObservableObject {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
-    // Clicking the status item while the popover is open auto-dismisses it
-    // AND fires the action — without this guard the click reopens instead of
+    // Clicking the status item while the popover is open can auto-dismiss it
+    // AND fire the action — without this guard the click reopens instead of
     // closing. 0.4s is below human double-tap speed for a deliberate reopen.
     private var popoverClosedAt = Date.distantPast
+    // The close animation runs ~0.5s with isShown still true. If an outside
+    // click started it and you then click the bar, that click means "open".
+    private var popoverClosing = false
+    private var closedByOutsideClick = false
+    private var reopenAfterClose = false
     // The view the popover's arrow points at: the status button, or the
     // island capsule in "middle" mode.
     private weak var popoverAnchor: NSView?
     let store = UsageStore()
     private var settingsWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
+    private let hotKey = HotKey()
     private var islandPanel: NSPanel?
     private var islandField: NSTextField?
 
@@ -290,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.target = self
 
-        popover.behavior = .semitransient // detaches when dragged into a window
+        popover.behavior = .semitransient
         popover.delegate = self
         let host = NSHostingController(rootView: PopoverView(store: store))
         host.sizingOptions = .preferredContentSize
@@ -300,16 +392,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.statusItem.button?.attributedTitle = self.store.menuTitle
             self.statusItem.button?.toolTip = self.store.menuToolTip
+            self.statusItem.button?.setAccessibilityLabel("MeowBar. " + self.store.menuToolTip)
             self.layoutIsland()
         }
         store.onAlert = { [weak self] in self?.flashMenuItem() }
-        store.start()
-        Notifier.requestPermission()
+        // First run explains the Keychain prompt before anything triggers it.
+        if UserDefaults.standard.bool(forKey: "meowbar.onboarded")
+            || ProcessInfo.processInfo.environment["MEOWBAR_DEMO"] != nil {
+            beginMonitoring()
+        } else {
+            showOnboarding()
+        }
 
         applyPosition()
+        applyHotKey()
         NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applyPosition()
+            self?.applyHotKey()
             self?.store.onUpdate?()
             self?.store.refresh()
         }
@@ -319,9 +419,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // .transient is unreliable for accessory apps — explicitly close on
-        // any outside click while the popover is up.
+        // any outside click while the popover is up. Recent macOS also routes
+        // clicks on our own status item through here; those belong to
+        // togglePopover, or one click would close and toggle at once.
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.popover.performClose(nil)
+            guard let self, self.popover.isShown else { return }
+            let p = NSEvent.mouseLocation
+            if self.statusItem.button?.window?.frame.contains(p) == true
+                || (self.islandPanel?.isVisible == true && self.islandPanel?.frame.contains(p) == true) {
+                return
+            }
+            if !self.popoverClosing { self.closedByOutsideClick = true }
+            self.popover.performClose(nil)
         }
         // Popover never takes key (battery-menu behavior) — typing goes to
         // whatever app you're in. This only fires while we're key anyway
@@ -345,6 +454,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.popover.positioningRect = anchor.bounds
             }
         }
+    }
+
+    private func beginMonitoring() {
+        store.start()
+        Notifier.requestPermission()
+    }
+
+    private func applyHotKey() {
+        let id = UserDefaults.standard.string(forKey: "meowbar.hotkey") ?? HotKey.defaultID
+        hotKey.register(id: id) { [weak self] in self?.togglePopover() }
+    }
+
+    // MARK: Onboarding (first launch only)
+
+    private func showOnboarding() {
+        let view = OnboardingView { [weak self] choices in self?.finishOnboarding(choices) }
+        let w = NSWindow(contentViewController: NSHostingController(rootView: view))
+        w.title = "Welcome to MeowBar"
+        w.styleMask = [.titled, .closable, .fullSizeContentView]
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.center()
+        onboardingWindow = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // nil = closed without "Get started": start with defaults, change nothing.
+    private func finishOnboarding(_ choices: OnboardingView.Choices?) {
+        guard !UserDefaults.standard.bool(forKey: "meowbar.onboarded") else { return }
+        UserDefaults.standard.set(true, forKey: "meowbar.onboarded")
+        if let choices {
+            UserDefaults.standard.set(choices.autoClock, forKey: "meowbar.autoClock")
+            if choices.alwaysFresh { try? StatuslineBridge.install() }
+            if choices.launchAtLogin {
+                try? SMAppService.mainApp.register()
+                UserDefaults.standard.set(true, forKey: "meowbar.launchAtLogin")
+            }
+        }
+        let w = onboardingWindow
+        onboardingWindow = nil
+        w?.close()
+        beginMonitoring()
     }
 
     // MARK: Settings window
@@ -423,6 +577,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePopover() {
         if popover.isShown {
+            // Clicked away, then straight back on the bar mid-fade: reopen
+            // once the close lands instead of swallowing the click.
+            if popoverClosing && closedByOutsideClick {
+                reopenAfterClose = true
+                return
+            }
             popover.performClose(nil)
             return
         }
@@ -494,23 +654,42 @@ private final class IslandView: NSVisualEffectView {
     }
 }
 
+extension AppDelegate: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        if (notification.object as? NSWindow) === onboardingWindow { finishOnboarding(nil) }
+    }
+}
+
+// No detaching: a click with a few pixels of drag turned the popover into a
+// window, and afterwards AppKit left the popover's own window at alpha 0 —
+// every later click showed it invisibly and it closed itself.
 extension AppDelegate: NSPopoverDelegate {
+    func popoverDidShow(_ notification: Notification) {
+        // Belt and braces: never leave a shown popover transparent.
+        if let w = popover.contentViewController?.view.window, w.alphaValue < 1 {
+            w.alphaValue = 1
+        }
+    }
+
+    func popoverWillClose(_ notification: Notification) {
+        popoverClosing = true
+    }
+
     func popoverDidClose(_ notification: Notification) {
         popoverClosedAt = Date()
+        popoverClosing = false
+        closedByOutsideClick = false
+        if reopenAfterClose {
+            reopenAfterClose = false
+            popoverClosedAt = .distantPast
+            togglePopover()
+        }
     }
+}
 
-    func popoverShouldDetach(_ popover: NSPopover) -> Bool { true }
-
-    // Dragging the popover off the bar detaches it into a floating window.
-    func detachableWindow(for popover: NSPopover) -> NSWindow? {
-        let host = NSHostingController(rootView: PopoverView(store: store))
-        let w = NSWindow(contentViewController: host)
-        w.title = "MeowBar"
-        w.styleMask = [.titled, .closable]
-        w.isReleasedWhenClosed = false
-        w.level = .floating
-        return w
-    }
+// `MeowBar --json` prints the last-good numbers and exits (no UI).
+if CommandLine.arguments.contains("--json") {
+    exit(UsageJSON.printCached() ? 0 : 1)
 }
 
 let app = NSApplication.shared

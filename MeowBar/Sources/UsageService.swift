@@ -3,41 +3,7 @@ import CommonCrypto
 import SQLite3
 import UserNotifications
 
-// MARK: - Models
-
-struct UsageWindow {
-    var usedPercent: Double = 0
-    var resetsAt: Date? = nil
-    var windowSeconds: TimeInterval? = nil
-}
-
-// What the user can do about an error state — rendered as a button under it.
-enum ProviderAction {
-    case renewClaude            // launch `claude` briefly so it self-renews
-    case runInTerminal(String)  // e.g. "codex login"
-    case openApp(String)        // e.g. "Devin" in /Applications
-
-    var title: String {
-        switch self {
-        case .renewClaude: return "Renew sign-in"
-        case .runInTerminal(let cmd): return "Run `\(cmd)` in Terminal"
-        case .openApp(let app): return "Open \(app)"
-        }
-    }
-}
-
-struct ProviderUsage {
-    var name: String
-    var session: UsageWindow? = nil
-    var weekly: UsageWindow? = nil
-    var error: String? = nil
-    var action: ProviderAction? = nil
-    var note: String? = nil       // plan label, e.g. "Pro" — shown alongside bars
-    var noteAccent: String? = nil // emphasized word, e.g. "unlimited" (green)
-    var fetchedAt: Date = Date()
-    var hasData: Bool { session != nil || weekly != nil }
-    var isVisible: Bool { hasData || note != nil || noteAccent != nil }
-}
+// MARK: - Errors (models live in Core/Models.swift)
 
 enum UsageError: LocalizedError {
     case noCredentials(String), http(Int, String), refreshFailed(String)
@@ -571,9 +537,10 @@ enum UsageService {
             guard parts.count >= 3, let pid = Int32(parts[0]),
                   let cpu = Double(parts[1]) else { continue }
             let executable = String(parts[2]).trimmingCharacters(in: .whitespaces)
-            // Ignore only the short-lived app-server MeowBar itself launches
-            // for usage data. An IDE-owned app-server can represent real work.
-            if meowbarCodexProcesses.contains(pid) { continue }
+            // Ignore only the short-lived processes MeowBar itself launches
+            // (codex app-server for usage data, the session-clock prompt).
+            // An IDE-owned app-server can represent real work.
+            if meowbarSpawned.contains(pid) { continue }
             if executable == "claude" { claudeExists = true }
             if executable == "codex" { codexExists = true }
             guard cpu > 1.5 else { continue }
@@ -593,6 +560,9 @@ enum UsageService {
     // Keep last-good data and back off instead of blanking the UI.
     private static var claudeCache: ProviderUsage? = nil
     private static var claudeBlockedUntil: Date = .distantPast
+    // Retry-After is short but the limit outlasts it — polling every 30s
+    // keeps the endpoint angry. Back off 1 → 2 → 4 … 15 min on repeat 429s.
+    private static var claude429Streak = 0
 
     // Plan label ("Max", "Pro", "Team") from the same keychain blob — free,
     // no extra call. subscriptionType comes first; rateLimitTier strings like
@@ -659,6 +629,7 @@ enum UsageService {
     static func fetchClaude() async -> ProviderUsage {
         if var cached = claudeCache, Date() < claudeBlockedUntil {
             cached.note = cached.note ?? claudePlanName()
+            cached.isStale = true
             return cached
         }
         var u = ProviderUsage(name: "Claude")
@@ -685,11 +656,15 @@ enum UsageService {
                     headers: ["Authorization": "Bearer \(token)", "anthropic-beta": "oauth-2025-04-20"])
                 let json = jsonDict(data)
                 if status == 429 {
-                    let wait = Double(hdrs["retry-after"] ?? "") ?? 120
+                    let backoff = min(900, 60 * pow(2, Double(claude429Streak)))
+                    let wait = max(Double(hdrs["retry-after"] ?? "") ?? 0, backoff)
+                    claude429Streak += 1
                     claudeBlockedUntil = Date().addingTimeInterval(wait)
-                    if let cached = claudeCache { return cached }
-                    throw UsageError.http(429, "rate-limited — retrying \(Notifier.countdown(to: claudeBlockedUntil))")
+                    if var cached = claudeCache { cached.isStale = true; return cached }
+                    throw UsageError.actionable(
+                        "Anthropic is rate-limiting usage checks — retrying \(Notifier.countdown(to: claudeBlockedUntil))", nil)
                 }
+                if status == 200 { claude429Streak = 0 }
                 if (status == 401 || status == 403) && tried == 0 && reviveClaudeToken() {
                     // Claude Code renewed itself — reload and retry once.
                     tried += 1
@@ -1031,7 +1006,8 @@ enum Notifier {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    static func evaluate(_ u: ProviderUsage) {
+    // `others` lets a limit warning point at a tool that still has headroom.
+    static func evaluate(_ u: ProviderUsage, others: [ProviderUsage] = []) {
         let d = UserDefaults.standard
         // First launch: defaults register as true
         let on = { d.object(forKey: $0) == nil ? true : d.bool(forKey: $0) }
@@ -1051,8 +1027,13 @@ enum Notifier {
             else if on("meowbar.alert75"), w.usedPercent >= 75 { level = 75 }
             let prev = lastLevel[key] ?? 0
             if level > prev {
-                notify("\(u.name) \(label): \(Int(w.usedPercent))% used",
-                       body: w.resetsAt.map { "Resets \(Self.countdown(to: $0))." } ?? "")
+                var body = w.resetsAt.map { "Resets \(Self.countdown(to: $0))." } ?? ""
+                if level >= 90, let alt = others
+                    .compactMap({ o in o.displayLeft.map { (o.name, $0) } })
+                    .filter({ $0.1 >= 30 }).max(by: { $0.1 < $1.1 }) {
+                    body += (body.isEmpty ? "" : " ") + "\(alt.0) has \(Int(alt.1))% left."
+                }
+                notify("\(u.name) \(label): \(Int(w.usedPercent))% used", body: body)
             }
             lastLevel[key] = w.usedPercent < 70 ? 0 : max(prev, level)
         }
@@ -1066,13 +1047,7 @@ enum Notifier {
             UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }
 
-    static func countdown(to date: Date) -> String {
-        let s = max(0, Int(date.timeIntervalSinceNow))
-        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
-        if d > 0 { return "in \(d)d \(h)h" }
-        if h > 0 { return "in \(h)h \(m)m" }
-        return "in \(m)m"
-    }
+    static func countdown(to date: Date) -> String { Countdown.long(to: date) }
 }
 
 // MARK: - Claude statusline bridge
@@ -1132,10 +1107,13 @@ enum StatuslineBridge {
         // timestamped backup — restored on uninstall if needed
         try? fm.copyItem(atPath: claudeSettingsPath, toPath: backupPath)
 
-        // 3. preserve any existing statusLine as the chain target (unless it's
-        //    already ours)
-        if let sl = settings["statusLine"] as? [String: Any],
-           let cmd = sl["command"] as? String, cmd != helperPath, !cmd.isEmpty {
+        // 3. preserve any existing statusLine as the chain target. Already
+        //    ours (re-install, e.g. from onboarding) → keep the stored
+        //    original untouched, or the user's own status line is lost.
+        let current = (settings["statusLine"] as? [String: Any])?["command"] as? String
+        if current == helperPath {
+            // nothing to record
+        } else if let cmd = current, !cmd.isEmpty {
             let orig: [String: Any] = ["command": cmd]
             if let d = try? JSONSerialization.data(withJSONObject: orig) {
                 try? d.write(to: URL(fileURLWithPath: originalPath))
@@ -1200,7 +1178,43 @@ private final class ProcessIDRegistry: @unchecked Sendable {
     }
 }
 
-private let meowbarCodexProcesses = ProcessIDRegistry()
+private let meowbarSpawned = ProcessIDRegistry()
+
+// MARK: - Session clock
+
+extension UsageService {
+    // Opens Claude's 5h window now with a one-word prompt on the cheapest
+    // model. Runs in an empty folder with user settings skipped (no hooks,
+    // plugins or MCP servers fire), no tools, and nothing saved to disk.
+    // Blocking — call off the main thread. True when Claude answered.
+    static func startClaudeClock() -> Bool {
+        guard let bin = cliPath("claude") else { return false }
+        let dir = StatuslineBridge.supportDir + "/clock"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let p = Process(), out = Pipe()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["-p", "hi", "--model", "haiku", "--tools", "",
+                       "--no-session-persistence", "--setting-sources", "project",
+                       "--strict-mcp-config", "--disable-slash-commands",
+                       "--output-format", "text"]
+        p.currentDirectoryURL = URL(fileURLWithPath: dir)
+        // GUI apps get a minimal PATH; an npm-installed `claude` needs node.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = ((bin as NSString).deletingLastPathComponent) + ":/opt/homebrew/bin:/usr/local/bin:"
+            + (env["PATH"] ?? "/usr/bin:/bin")
+        p.environment = env
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        meowbarSpawned.insert(p.processIdentifier)
+        defer { meowbarSpawned.remove(p.processIdentifier) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 90) { p.terminate() }
+        let reply = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return p.terminationStatus == 0 && !reply.isEmpty
+    }
+}
 
 private enum CodexRPC {
     // One-shot session: initialize → initialized → account/read +
@@ -1216,11 +1230,11 @@ private enum CodexRPC {
         do { try p.run() } catch {
             throw UsageError.noCredentials("Couldn't start Codex: \(error.localizedDescription)")
         }
-        meowbarCodexProcesses.insert(p.processIdentifier)
+        meowbarSpawned.insert(p.processIdentifier)
         // Watchdog: a stuck server must never block a refresh cycle.
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) { p.terminate() }
         defer {
-            meowbarCodexProcesses.remove(p.processIdentifier)
+            meowbarSpawned.remove(p.processIdentifier)
             p.terminate()
         }
 

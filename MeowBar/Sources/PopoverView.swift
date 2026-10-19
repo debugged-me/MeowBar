@@ -1,7 +1,14 @@
 import SwiftUI
 
+// Derive from the semantic foreground instead of a fixed gray. It remains
+// legible when the glass moves over light, dark, or tinted UI.
+private func supportingText(_ scheme: ColorScheme) -> Color {
+    Color.primary.opacity(scheme == .dark ? 0.76 : 0.70)
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
+    @Environment(\.colorScheme) private var colorScheme
 
     @ViewBuilder
     var body: some View {
@@ -26,22 +33,45 @@ struct PopoverView: View {
                 ProviderBlock(usage: store.devin, running: store.devinRunning, store: store)
             }
             Divider()
-            HStack {
-                Spacer()
-                Button {
-                    NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
-                } label: {
-                    Image(systemName: "gearshape").font(.caption)
-                }
-                .controlSize(.small)
-                .buttonStyle(.borderless)
-                .help("Settings")
-                Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
-            }
+            footer
         }
         .padding(12)
         .frame(width: 290)
         .foregroundStyle(.primary)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            CatView(mood: catMood)
+            if let at = store.lastUpdated {
+                Text("updated \(Countdown.ago(at))")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(supportingText(colorScheme))
+            }
+            Spacer()
+            if let update = store.update, let url = UpdateCheck.downloadURL(update) {
+                Button("Update") { NSWorkspace.shared.open(url) }
+                    .controlSize(.small)
+                    .help("MeowBar \(update.version) is available" + (update.notes.map { " — \($0)" } ?? ""))
+            }
+            Button {
+                NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
+            } label: {
+                Image(systemName: "gearshape").font(.caption)
+            }
+            .controlSize(.small)
+            .buttonStyle(.borderless)
+            .help("Settings")
+            Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
+        }
+    }
+
+    private var catMood: CatView.Mood {
+        if [store.claude, store.codex, store.devin].contains(where: { ($0.worstUsed ?? 0) >= 90 }) {
+            return .startled
+        }
+        if store.claudeRunning || store.codexRunning || store.devinRunning { return .working }
+        return .napping
     }
 }
 
@@ -49,6 +79,7 @@ struct ProviderBlock: View {
     let usage: ProviderUsage
     var running: Bool = false
     var store: UsageStore? = nil
+    @State private var expanded = false
     @Environment(\.colorScheme) private var colorScheme
 
     private var brandColor: Color {
@@ -75,19 +106,46 @@ struct ProviderBlock: View {
         Bundle.main.image(forResource: usage.name.lowercased())
     }
 
+    // History only makes sense for providers with metered windows.
+    private var canExpand: Bool { usage.hasData && store != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            // header: icon + name + running badge …… plan pill
+            // header: icon + name (› opens history) + running/stale …… plan pill
             HStack(spacing: 6) {
                 if let icon = providerIcon {
                     Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
                         .frame(width: 13, height: 13)
                 }
-                Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
+                let name = Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
+                if canExpand {
+                    Button {
+                        withAnimation(.snappy(duration: 0.25)) { expanded.toggle() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            name
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(supportingText(colorScheme))
+                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(expanded ? "Hide history" : "Show the last 7 days")
+                } else {
+                    name
+                }
                 if running {
                     Text("running")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(successColor)
+                } else if usage.isStale, Date().timeIntervalSince(usage.fetchedAt) >= 60 {
+                    Label(Countdown.ago(usage.fetchedAt), systemImage: "clock")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(supportingText(colorScheme))
+                        .help("Last numbers MeowBar got — it keeps retrying")
                 }
                 Spacer()
                 if usage.note != nil || usage.noteAccent != nil {
@@ -108,10 +166,17 @@ struct ProviderBlock: View {
                 }
             }
 
+            if expanded && canExpand {
+                HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             if let err = usage.error {
+                // Red only when there's something to fix; transient states
+                // (rate limits, retries) read as information.
                 Text(err)
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(usage.action != nil ? Color.red : supportingText(colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
                 if let action = usage.action {
                     Button(action.title) {
@@ -125,34 +190,83 @@ struct ProviderBlock: View {
             let unlimited = usage.noteAccent == "unlimited" && !usage.hasData
             if !unlimited && (usage.hasData || usage.error == nil) {
                 let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
-                WindowRow(title: sessionLabel, w: usage.session, tint: brandColor)
-                WindowRow(title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
+                WindowRow(provider: usage.name, title: sessionLabel, w: usage.session, tint: brandColor,
+                          clockStarting: usage.name == "Claude" && store?.clockStarting == true)
+                WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
     }
 }
 
+// Last 7 days as a strip of day bars (today solid) plus the busiest hours.
+struct HistoryStrip: View {
+    let samples: [UsageSample]
+    var tint: Color
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var unit: String { samples.contains { $0.weekly != nil } ? "weekly" : "session" }
+
+    private func dayLabel(_ i: Int, of count: Int) -> String {
+        let ago = count - 1 - i
+        if ago == 0 { return "Today" }
+        if ago == 1 { return "Yesterday" }
+        let day = Calendar.current.date(byAdding: .day, value: -ago, to: Date()) ?? Date()
+        return day.formatted(.dateTime.weekday(.wide))
+    }
+
+    var body: some View {
+        let days = UsageHistory.dailyBurn(samples)
+        let peak = days.max() ?? 0
+        if peak <= 0 {
+            Text("Collecting history — check back tomorrow")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(supportingText(colorScheme))
+        } else {
+            HStack(alignment: .bottom, spacing: 10) {
+                HStack(alignment: .bottom, spacing: 3) {
+                    ForEach(Array(days.enumerated()), id: \.offset) { i, v in
+                        Capsule()
+                            .fill(tint.opacity(i == days.count - 1 ? 1 : 0.5))
+                            .frame(width: 7, height: max(2, 22 * v / peak))
+                            .help("\(dayLabel(i, of: days.count)) · \(Int(v.rounded()))% of the \(unit) limit")
+                    }
+                }
+                .frame(height: 22, alignment: .bottom)
+                Spacer()
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text("last 7 days")
+                    if let b = UsageHistory.busiestBlock(samples) {
+                        Text("busiest \(UsageHistory.blockLabel(startHour: b))")
+                    }
+                }
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(supportingText(colorScheme))
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Last 7 days: " + days.enumerated()
+                .map { "\(dayLabel($0.offset, of: days.count)) \(Int($0.element.rounded())) percent" }
+                .joined(separator: ", "))
+        }
+    }
+}
+
 struct WindowRow: View {
+    var provider: String = ""
     let title: String
     let w: UsageWindow?
     var tint: Color = .accentColor
+    var clockStarting = false
     @Environment(\.colorScheme) private var colorScheme
-
-    private var supportingText: Color {
-        // Derive from the semantic foreground instead of a fixed gray. It
-        // remains legible when the glass moves over light, dark, or tinted UI.
-        Color.primary.opacity(colorScheme == .dark ? 0.76 : 0.70)
-    }
 
     var body: some View {
         if let w {
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
-                    Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText)
+                    Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText(colorScheme))
                     Spacer()
                     (Text("\(Int(w.usedPercent))%").font(.caption.weight(.semibold))
                         + Text(" used · \(Int(max(0, 100 - w.usedPercent)))% left")
-                        .font(.caption).foregroundStyle(supportingText))
+                        .font(.caption).foregroundStyle(supportingText(colorScheme)))
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(.easeOut(duration: 0.35), value: w.usedPercent)
@@ -165,20 +279,32 @@ struct WindowRow: View {
                         Capsule().fill(barColor)
                             .frame(width: max(0, geo.size.width * min(w.usedPercent, 100) / 100))
                             .animation(.spring(duration: 0.5, bounce: 0.15), value: w.usedPercent)
+                        // Even-pace marker: where usage would sit if burned
+                        // evenly. Fill past it = ahead of pace.
+                        if let f = w.elapsedFraction(), f > 0.02, f < 0.98 {
+                            Capsule().fill(Color.primary.opacity(0.6))
+                                .frame(width: 2, height: 10)
+                                .offset(x: geo.size.width * f - 1)
+                        }
                     }
                 }
                 .frame(height: 6)
+                .help(paceHelp)
                 HStack {
-                    Text(resetText).font(.caption2.weight(.medium)).foregroundStyle(supportingText).lineLimit(1)
+                    Text(resetText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
+                        .help(resetHelp)
                     Spacer()
-                    Text(paceText).font(.caption2.weight(.medium)).foregroundStyle(supportingText)
+                    Text(w.paceVerdict()).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme))
                 }
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(provider) \(title.replacingOccurrences(of: " · ", with: ", ")): "
+                + "\(Int(w.usedPercent)) percent used. \(resetText). \(w.paceVerdict())")
         } else {
             HStack {
-                Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText)
+                Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText(colorScheme))
                 Spacer()
-                Text("—").font(.caption).foregroundStyle(supportingText)
+                Text("—").font(.caption).foregroundStyle(supportingText(colorScheme))
             }
         }
     }
@@ -192,29 +318,115 @@ struct WindowRow: View {
         // Claude's 5h window only opens on the first message — while idle the
         // API reports 0% with resets_at: null, so there's no clock to count.
         guard let reset = w?.resetsAt else {
+            if clockStarting { return "starting the clock…" }
             return (w?.usedPercent ?? 0) == 0 ? "starts on first message" : ""
         }
         if reset <= Date() { return "resetting now" }
-        return "resets \(Notifier.countdown(to: reset))"
+        return "resets \(Countdown.long(to: reset))"
     }
 
-    // Projected usage at reset (linear burn since the window opened) → a
-    // one-word verdict. Hidden for the first 10 min of a window — too noisy.
-    private var paceText: String {
-        guard let w, let win = w.windowSeconds, let reset = w.resetsAt else { return "" }
-        if w.usedPercent >= 100 { return "maxed" }
-        let remaining = reset.timeIntervalSinceNow
-        let elapsed = win - remaining
-        guard elapsed > 600 else { return "" }
-        let usedFrac = w.usedPercent / 100
-        let projected = usedFrac * win / elapsed
-        if projected >= 1 {
-            let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
-            guard secondsToFull < remaining else { return "cutting it close" }
-            return "hit limit \(Notifier.countdown(to: Date().addingTimeInterval(secondsToFull)))"
+    // Exact reset time on hover: "Resets at 1:12 PM" / "Resets Tue at 1:12 PM".
+    private var resetHelp: String {
+        guard let reset = w?.resetsAt, reset > Date() else { return "" }
+        let time = reset.formatted(date: .omitted, time: .shortened)
+        if Calendar.current.isDateInToday(reset) { return "Resets at \(time)" }
+        return "Resets \(reset.formatted(.dateTime.weekday(.abbreviated))) at \(time)"
+    }
+
+    private var paceHelp: String {
+        guard let w, let f = w.elapsedFraction() else { return "" }
+        return "At an even pace you'd be at \(Int(f * 100))% by now — you're at \(Int(w.usedPercent))%"
+    }
+}
+
+// The mascot: naps when nothing's running, trots while an agent works,
+// startles when a limit is close. Holds still under Reduce Motion.
+struct CatView: View {
+    enum Mood { case napping, working, startled }
+    let mood: Mood
+    var size: CGFloat = 13
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            ZStack(alignment: .bottomLeading) {
+                Image(systemName: "cat.fill")
+                    .font(.system(size: size))
+                    .foregroundStyle(color)
+                    .scaleEffect(breath(t), anchor: .bottom)
+                    .rotationEffect(.degrees(tilt(t)), anchor: .bottom)
+                    .offset(y: hop(t))
+                badge(t)
+            }
+            .frame(width: size * 2.2, height: size * 1.5, alignment: .bottomLeading)
         }
-        if projected < 0.55 { return "plenty left" }
-        if projected < 0.85 { return "comfortable" }
-        return "cutting it close"
+        .help(caption)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(caption)
+    }
+
+    private var caption: String {
+        switch mood {
+        case .napping: return "Napping — nothing running"
+        case .working: return "Working — an agent is running"
+        case .startled: return "Startled — a limit is close"
+        }
+    }
+
+    private var color: Color {
+        switch mood {
+        case .napping: return supportingText(colorScheme)
+        case .working: return colorScheme == .dark
+            ? Color(red: 0.31, green: 0.93, blue: 0.55) : Color(red: 0.00, green: 0.43, blue: 0.19)
+        case .startled: return .orange
+        }
+    }
+
+    private func breath(_ t: Double) -> Double {
+        switch mood {
+        case .napping: return 1 + 0.04 * sin(t * 2 * .pi / 3.2)
+        case .startled: return t.truncatingRemainder(dividingBy: 2) < 0.15 ? 1.1 : 1
+        case .working: return 1
+        }
+    }
+
+    private func tilt(_ t: Double) -> Double {
+        switch mood {
+        case .working: return 5 * sin(t * 2 * .pi * 1.8)
+        case .startled:
+            // A short shake every 2s, decaying.
+            let p = t.truncatingRemainder(dividingBy: 2)
+            return p < 0.45 ? 7 * sin(p * 2 * .pi * 9) * (1 - p / 0.45) : 0
+        case .napping: return 0
+        }
+    }
+
+    private func hop(_ t: Double) -> Double {
+        mood == .working ? -abs(sin(t * 2 * .pi * 1.8)) * size * 0.18 : 0
+    }
+
+    @ViewBuilder
+    private func badge(_ t: Double) -> some View {
+        switch mood {
+        case .napping:
+            // Two z's drifting up and fading, staggered.
+            ForEach(0..<2) { i in
+                let p = (t / 2.6 + Double(i) * 0.5).truncatingRemainder(dividingBy: 1)
+                Text("z")
+                    .font(.system(size: size * (i == 0 ? 0.55 : 0.45), weight: .bold, design: .rounded))
+                    .foregroundStyle(supportingText(colorScheme))
+                    .opacity(sin(p * .pi))
+                    .offset(x: size * (1.4 + 0.3 * p), y: -size * (0.6 + 0.5 * p))
+            }
+        case .startled:
+            Text("!")
+                .font(.system(size: size * 0.7, weight: .heavy, design: .rounded))
+                .foregroundStyle(.orange)
+                .offset(x: size * 1.5, y: -size * 0.55)
+        case .working:
+            EmptyView()
+        }
     }
 }

@@ -23,17 +23,33 @@ those numbers where they belong: always visible, always fresh, zero setup.
   MeowBar launches `claude` briefly so it renews itself; error states carry
   action buttons (`Run codex login in Terminal`, `Open Devin`, …)
 - **Pace verdicts** — `plenty left` / `comfortable` / `cutting it close` /
-  `hit limit in …` projected from the window's burn rate
+  `hit limit in …` projected from the window's burn rate, plus an even-pace
+  marker on every bar (fill past the tick = ahead of pace)
+- **Auto-started session clock** — Claude's 5-hour window only opens on your
+  first message; when it's idle and you're at your Mac, MeowBar opens it with
+  a one-word Haiku prompt so the reset comes sooner (Settings → Claude)
+- **History** — click a provider's name for its last 7 days and busiest hours,
+  kept locally for 8 days
+- **Never blank** — last-good numbers are cached on disk; a relaunch or rate
+  limit shows them (with their age) instead of an error, and repeated 429s
+  back off exponentially
+- **A cat** — naps when nothing's running, trots while an agent works,
+  startles near a limit (holds still with Reduce Motion)
+- **Global shortcut** — ⌃⌥M opens the popover from anywhere (configurable)
+- **Scriptable** — `MeowBar.app/Contents/MacOS/MeowBar --json` prints the
+  cached numbers for shell prompts and scripts
 - **Popover detail** — plan name (`Plus`, `Pro · unlimited`), session + weekly
-  bars in brand colors, reset countdowns; drag it off the bar to detach into a
-  floating window
+  bars in brand colors, reset countdowns
 - **Positions** — sit on the right with the other icons or float center-top as
   an "island" under the notch (Settings → Position)
 - **Display modes** — % left or countdown-to-reset in the bar
 - **Optional third provider** — Devin quota when the Devin IDE is signed in;
   hidden entirely otherwise
 - **Configurable alerts** — macOS notifications at 75 / 90 / 95% and on window
-  reset, each toggleable in Settings
+  reset, each toggleable in Settings; near a limit they point at the other
+  tool if it has headroom ("Codex has 70% left")
+- **Update check** — once a day against `version.json` next to the DMG (set
+  `MeowBarUpdateURL` in `Info.plist`; empty = off)
 - **Polite** — Liquid Glass popover, dismisses on any key or outside click
 - **Persistent** — launch-at-login toggle in Settings
 - **Featherweight** — native Swift, ~100 MB RAM, 0% CPU idle
@@ -61,18 +77,36 @@ paths macOS already protects.
 ## Build
 
 ```sh
-./build.sh   # → build/MeowBar.app + build/MeowBar.dmg (and ./MeowBar.dmg for the site)
+./build.sh   # → build/MeowBar.app + build/MeowBar.dmg (+ ./MeowBar.dmg, ./version.json for the site)
+swift test   # unit tests for the pure logic in MeowBar/Sources/Core
 ```
 
-Single `swiftc` invocation — no Xcode project, no dependencies.
+Plain `swiftc` — no Xcode project, no dependencies. `Package.swift` exists only
+for the tests.
+
+Signing is ad-hoc by default. With an Apple Developer ID:
+
+```sh
+xcrun notarytool store-credentials meowbar          # once
+MEOWBAR_SIGN_ID="Developer ID Application: Your Name (TEAMID)" \
+MEOWBAR_NOTARY_PROFILE=meowbar ./build.sh            # signed, notarized, stapled DMG
+```
+
+To ship an update: bump `CFBundleShortVersionString` in `Info.plist`, build,
+and upload `MeowBar.dmg` + `version.json` side by side.
 
 ## Files
 
 ```
-MeowBar/Sources/main.swift            app, menu bar, island panel, alert engine
-MeowBar/Sources/UsageService.swift    credentials, providers, statusline bridge
-MeowBar/Sources/PopoverView.swift     popover UI
+MeowBar/Sources/main.swift            app, menu bar, island panel, alert engine, store
+MeowBar/Sources/UsageService.swift    credentials, providers, statusline bridge, session clock
+MeowBar/Sources/PopoverView.swift     popover UI, history strip, cat
 MeowBar/Sources/SettingsView.swift    settings window
+MeowBar/Sources/OnboardingView.swift  first-launch window
+MeowBar/Sources/AppSupport.swift      on-disk cache/history, --json, update check
+MeowBar/Sources/HotKey.swift          global shortcut
+MeowBar/Sources/Core/                 pure logic (models, pace, history, clock) — unit-tested
+Tests/MeowBarCoreTests/               swift test
 MeowBar/Sources/statusline/main.swift meowbar-statusline helper (Claude bridge)
 index.html                            landing page (self-contained, pairs with MeowBar.dmg)
 ```
