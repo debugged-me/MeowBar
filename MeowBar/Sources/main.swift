@@ -328,17 +328,32 @@ final class UsageStore: ObservableObject {
             catY = trotPhase ? -3.4 : -2.2
         }
 
-        // Compact mode: one cat silhouette tinted by the worst window —
-        // gray calm, orange near a limit, red at the wall.
+        // Compact mode: one cat silhouette tinted by the worst window,
+        // then each provider's % left in small type — the minimal readout.
         if ud.bool(forKey: "meowbar.compact") {
             let worst = [claude, codex, devin].compactMap(\.worstUsed).max()
-            let color: NSColor = worst == nil ? .secondaryLabelColor
+            let catColor: NSColor = worst == nil ? .secondaryLabelColor
                 : worst! >= 90 ? .systemRed : worst! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             let att = NSTextAttachment()
-            att.image = CatGlyph.tinted(size: 16, color)
+            att.image = CatGlyph.tinted(size: 16, catColor)
             att.bounds = CGRect(x: 0, y: catY, width: 16, height: 14.7)
             s.append(NSAttributedString(attachment: att))
+            s.append(NSAttributedString(string: "  "))
+            let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+            let faint = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+            for (i, u) in [claude, codex].enumerated() {
+                if i > 0 {
+                    s.append(NSAttributedString(string: " | ", attributes: [
+                        .foregroundColor: NSColor.tertiaryLabelColor, .font: faint]))
+                }
+                let sev = u.worstUsed
+                let c: NSColor = sev == nil ? .secondaryLabelColor
+                    : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
+                s.append(NSAttributedString(
+                    string: u.displayLeft.map { String(format: "%.0f%%", $0) } ?? "–",
+                    attributes: [.foregroundColor: c, .font: small]))
+            }
             return s
         }
 

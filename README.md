@@ -106,7 +106,7 @@ sooner (Settings → Claude → Start the 5h clock).
 | --- | --- |
 | **Position** | Right with the other icons, or a floating "island" centered under the notch — the island gets a cat mark and a hairline tinted by your worst window |
 | **Show** | `% left`, `time until reset`, or `time until empty` — the last one is pace-projected (`~2h` means you'd hit the cap in about 2 hours) |
-| **Compact** | Collapses the bar to a single cat silhouette tinted by your worst window — gray calm, orange near a limit, red at the wall |
+| **Compact** | A cat tinted by your worst window plus small `% left` numbers — the minimal readout |
 | **Trot** | A small cat bob in the menu bar whenever an agent is running (off by default — the bar stays perfectly still) |
 | **Open MeowBar with** | A global hotkey (⌃⌥M by default) to pop it from anywhere |
 | **Alerts** | Four independent toggles: 75%, 90%, 95%, and window reset |
