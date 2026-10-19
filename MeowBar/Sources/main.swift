@@ -305,15 +305,6 @@ final class UsageStore: ObservableObject {
         return img
     }
 
-    // The app badge — used where the cat silhouette reads too muddy at
-    // menu-bar size (compact mode, the trot bob).
-    private func appBadgeImage() -> NSImage? {
-        if let img = iconCache["appbadge"] { return img }
-        guard let img = NSApp.applicationIconImage?.copy() as? NSImage else { return nil }
-        img.size = NSSize(width: 16, height: 16)
-        iconCache["appbadge"] = img
-        return img
-    }
 
     private var trotPhase = false
 
@@ -327,13 +318,18 @@ final class UsageStore: ObservableObject {
             catY = trotPhase ? -3.4 : -2.2
         }
 
-        // Compact mode: the app badge, then each provider's % left in
-        // small type — the minimal readout. Severity lives in the numbers.
+        // Compact mode: a walking cat tinted by the worst window, then
+        // each provider's % left in small type — the minimal readout.
         if ud.bool(forKey: "meowbar.compact") {
+            let worst = [claude, codex, devin].compactMap(\.worstUsed).max()
+            let catColor: NSColor = worst == nil ? .secondaryLabelColor
+                : worst! >= 90 ? .systemRed : worst! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             let att = NSTextAttachment()
-            att.image = appBadgeImage()
-            att.bounds = CGRect(x: 0, y: catY, width: 16, height: 16)
+            att.image = CatGlyph.tintedImage(
+                CatGlyph.bodyImage(size: 13, stride: trotting ? trotPhase : true),
+                catColor, key: "compact-\(trotPhase)-\(catColor.description)")
+            att.bounds = CGRect(x: 0, y: catY, width: 19.5, height: 13)
             s.append(NSAttributedString(attachment: att))
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
@@ -416,11 +412,13 @@ final class UsageStore: ObservableObject {
         }
         let t = NSMutableAttributedString()
         if trotting {
-            // The trot: the app badge bobs beside the numbers while
-            // agents work — a silhouette reads too muddy at this size.
+            // The trot: a walking cat whose legs actually alternate with
+            // each rebuild — two stride poses, not just a bob.
             let att = NSTextAttachment()
-            att.image = appBadgeImage()
-            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 15)
+            att.image = CatGlyph.tintedImage(
+                CatGlyph.bodyImage(size: 12, stride: trotPhase),
+                .labelColor, key: "trot-\(trotPhase)")
+            att.bounds = CGRect(x: 0, y: catY, width: 18, height: 12)
             t.append(NSAttributedString(attachment: att))
             t.append(NSAttributedString(string: "  "))
         }

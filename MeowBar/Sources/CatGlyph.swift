@@ -54,9 +54,11 @@ enum CatGlyph {
     // The silhouette drawn in a specific color — for attributed-string
     // attachments, which can't take a template image's ambient tint.
     static func tinted(size: CGFloat, _ color: NSColor) -> NSImage {
-        let key = "\(size)-\(color.description)"
+        tintedImage(image(size: size), color, key: "\(size)-\(color.description)")
+    }
+
+    static func tintedImage(_ base: NSImage, _ color: NSColor, key: String) -> NSImage {
         if let img = tintCache[key] { return img }
-        let base = image(size: size)
         let img = NSImage(size: base.size, flipped: false) { rect in
             base.draw(in: rect)
             color.set()
@@ -64,6 +66,60 @@ enum CatGlyph {
             return true
         }
         img.isTemplate = false
+        tintCache[key] = img
+        return img
+    }
+
+    // A full-body cat in profile, mid-stride — tail up, front leg extended.
+    // Drawn for tiny sizes: one continuous silhouette, no interior detail.
+    static func bodyImage(size: CGFloat, stride: Bool = true) -> NSImage {
+        let key = "body-\(stride ? 1 : 0)-\(Int(size * 2))"
+        if let img = tintCache[key] { return img }
+        // Wider than tall: a walking cat is a landscape shape.
+        let s = NSSize(width: size * 1.5, height: size)
+        let img = NSImage(size: s, flipped: false) { rect in
+            let w = rect.width, h = rect.height
+            NSColor.black.set()
+
+            // Body — horizontal oval sitting above the legs.
+            NSBezierPath(ovalIn: NSRect(x: w * 0.22, y: h * 0.22,
+                                        width: w * 0.46, height: h * 0.42)).fill()
+
+            // Head — circle overlapping the body's front shoulder.
+            let hr = h * 0.20
+            NSBezierPath(ovalIn: NSRect(x: w * 0.60, y: h * 0.30,
+                                        width: hr * 2, height: hr * 2)).fill()
+
+            // Ear — triangle rooted inside the head.
+            let ear = NSBezierPath()
+            ear.move(to: NSPoint(x: w * 0.66, y: h * 0.55))
+            ear.line(to: NSPoint(x: w * 0.73, y: h * 0.88))
+            ear.line(to: NSPoint(x: w * 0.81, y: h * 0.55))
+            ear.close()
+            ear.fill()
+
+            // Tail — a stroke curving up from the rump.
+            let tail = NSBezierPath()
+            tail.lineWidth = h * 0.11
+            tail.lineCapStyle = .round
+            tail.move(to: NSPoint(x: w * 0.26, y: h * 0.48))
+            tail.curve(to: NSPoint(x: w * 0.04, y: h * 0.78),
+                       controlPoint1: NSPoint(x: w * 0.14, y: h * 0.55),
+                       controlPoint2: NSPoint(x: w * 0.02, y: h * 0.60))
+            tail.stroke()
+
+            // Legs — two strokes: back leg trailing, front leg reaching.
+            for (x0, x1) in stride ? [(0.32, 0.20), (0.60, 0.72)] : [(0.30, 0.26), (0.60, 0.64)] {
+                let leg = NSBezierPath()
+                leg.lineWidth = h * 0.11
+                leg.lineCapStyle = .round
+                leg.move(to: NSPoint(x: w * x0, y: h * 0.40))
+                leg.line(to: NSPoint(x: w * x1, y: h * 0.04))
+                leg.stroke()
+            }
+            return true
+        }
+        img.isTemplate = true
         tintCache[key] = img
         return img
     }
