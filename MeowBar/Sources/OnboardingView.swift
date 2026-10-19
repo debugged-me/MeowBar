@@ -26,6 +26,13 @@ struct OnboardingView: View {
                 }
             }
 
+            HStack(spacing: 8) {
+                MenuBarMock()
+                Text("— it lives up here")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.tertiary)
+            }
+
             Label {
                 Text("macOS will ask once to let MeowBar read **Claude Code-credentials** from your Keychain. Choose **Always Allow** — it's only used to ask Anthropic for your usage.")
                     .font(.callout)
@@ -73,6 +80,41 @@ struct OnboardingView: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
+        }
+    }
+}
+
+// A tiny picture of the thing you're installing: the menu-bar capsule with
+// the cat and both meters, rendered with the real glyphs.
+private struct MenuBarMock: View {
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(nsImage: CatGlyph.image(size: 18))
+                .renderingMode(.template)
+                .resizable().aspectRatio(contentMode: .fit)
+                .frame(width: 12, height: 11)
+                .foregroundStyle(.primary)
+            entry("claude", "82%")
+            entry("codex", "45%")
+        }
+        .padding(.horizontal, 11).padding(.vertical, 5)
+        .background(.regularMaterial, in: .capsule)
+        .overlay {
+            Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
+        }
+    }
+
+    private func entry(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 3) {
+            if let img = Bundle.main.image(forResource: icon) {
+                Image(nsImage: img)
+                    .resizable().aspectRatio(contentMode: .fit)
+                    .frame(width: 11, height: 11)
+            }
+            Text(text)
+                .font(.system(size: 10, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
         }
     }
 }

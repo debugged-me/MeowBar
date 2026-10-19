@@ -14,6 +14,9 @@ final class UsageStore: ObservableObject {
     @Published var history: [String: [UsageSample]] = [:]
     @Published var clockStarting = false
     @Published var update: UpdateInfo?
+    // Set briefly when a window resets (usage drops tens of points at once);
+    // the cat celebrates while it's in the future.
+    @Published var celebrateUntil: Date?
     // The popover's view stays alive while closed; anything animated must
     // check this or it keeps burning CPU off screen.
     @Published var popoverShown = false
@@ -71,7 +74,7 @@ final class UsageStore: ObservableObject {
         onUpdate?()
     }
 
-    private func checkForUpdate() {
+    func checkForUpdate() {
         Task {
             let info = await UpdateCheck.check()
             await MainActor.run { self.update = info }
@@ -139,9 +142,19 @@ final class UsageStore: ObservableObject {
             await MainActor.run {
                 self.refreshInFlight = false
                 let now = Date()
+                let olds = ["Claude": self.claude, "Codex": self.codex, "Devin": self.devin]
                 self.claude = self.withClock(ProviderUsage.merge(cl, over: self.claude, now: now), now: now)
                 self.codex = ProviderUsage.merge(co, over: self.codex, now: now)
                 self.devin = ProviderUsage.merge(dv, over: self.devin, now: now)
+                // A window that just reset drops tens of points in one step —
+                // nothing else moves usage backwards. The cat celebrates.
+                for u in [self.claude, self.codex, self.devin] where u.hasData && !u.isStale {
+                    guard let old = olds[u.name] else { continue }
+                    for (a, b) in [(old.session, u.session), (old.weekly, u.weekly)]
+                    where (a?.usedPercent ?? 0) - (b?.usedPercent ?? 0) >= 40 {
+                        self.celebrateUntil = now.addingTimeInterval(60)
+                    }
+                }
                 self.lastUpdated = now
                 for u in [self.claude, self.codex, self.devin] {
                     let pct = u.displayLeft, worst = u.worstUsed
@@ -422,6 +435,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         applyPosition()
         applyHotKey()
+
+        // Screenshot aid: float the popover mid-screen (MEOWBAR_POPOVER_SHOT).
+        if ProcessInfo.processInfo.environment["MEOWBAR_POPOVER_SHOT"] != nil {
+            PopoverShot.show()
+        }
         NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applyPosition()
@@ -432,6 +450,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: .init("meowbar.openSettings"),
                                                object: nil, queue: .main) { [weak self] _ in
             self?.openSettings()
+        }
+        NotificationCenter.default.addObserver(forName: .init("meowbar.checkUpdates"),
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.store.checkForUpdate()
         }
 
         // .transient is unreliable for accessory apps — explicitly close on
@@ -470,11 +492,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Popover never takes key (battery-menu behavior) — typing goes to
         // whatever app you're in. This only fires while we're key anyway
-        // (e.g. Settings open), in which case any key dismisses the popover.
+        // (e.g. Settings open), in which case the action keys below run and
+        // any other key dismisses the popover, as before.
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             if self.clearOrphanedPopover() { return nil }
             guard self.popover.isShown else { return event }
+            if event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
+               let key = event.charactersIgnoringModifiers?.lowercased() {
+                switch key {
+                case "r":
+                    self.store.refresh()
+                    return nil
+                case "q":
+                    NSApp.terminate(nil)
+                    return nil
+                case ",":
+                    self.popover.performClose(nil)
+                    self.openSettings()
+                    return nil
+                case "1", "2", "3":
+                    NotificationCenter.default.post(name: .init("meowbar.toggleProvider"), object: key)
+                    return nil
+                default:
+                    break
+                }
+            }
             self.popover.performClose(nil)
             return nil
         }
@@ -543,7 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openSettings() {
         if settingsWindow == nil {
-            let host = NSHostingController(rootView: SettingsView())
+            let host = NSHostingController(rootView: SettingsView(store: store))
             let w = NSWindow(contentViewController: host)
             w.title = "MeowBar Settings"
             w.styleMask = [.titled, .closable]

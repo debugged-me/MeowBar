@@ -14,16 +14,20 @@ those numbers where they belong: always visible, always fresh, zero setup.
 
 - **No accounts, no API keys** — reads the credentials your CLI tools already
   stored on your Mac (Keychain for Claude, `codex app-server` JSON-RPC for Codex)
-- **The icon is the meter** — brand icons fill bottom-up with usage; text turns
-  into short status words (`running`, `task done`, `nearing limit`, `limit
+- **The bar talks** — brand icons plus % left per provider; text turns into
+  short status words (`running`, `task done`, `nearing limit`, `limit
   reached`) that auto-clear
+- **Glance hierarchy** — a one-line status up top (`all quiet`, `Claude
+  maxed`, `2 agents working`), big rounded `% left` numbers, and when a
+  window maxes the number becomes a live reset-countdown chip
 - **Always-fresh Claude** — optional status-line bridge: Claude Code pushes its
   limits on every render, zero API polling, no 429s (Settings → Claude)
 - **Self-healing sign-in** — when the Claude token expires and refresh fails,
   MeowBar launches `claude` briefly so it renews itself; error states carry
   action buttons (`Run codex login in Terminal`, `Open Devin`, …)
 - **Pace verdicts** — `plenty left` / `comfortable` / `cutting it close` /
-  `may run out in ~…` — a rounded guess from the window's burn rate, silent until there's enough signal, plus an even-pace
+  `may run out in ~…` — a rounded guess from the window's burn rate, colored
+  green → orange → red, silent until there's enough signal, plus an even-pace
   marker on every bar (fill past the tick = ahead of pace)
 - **Auto-started session clock** — Claude's 5-hour window only opens on your
   first message; when it's idle and you're at your Mac, MeowBar opens it with
@@ -34,8 +38,11 @@ those numbers where they belong: always visible, always fresh, zero setup.
   limit shows them (with their age) instead of an error, and repeated 429s
   back off exponentially
 - **A cat** — naps when nothing's running, trots while an agent works,
-  startles near a limit (holds still with Reduce Motion)
-- **Global shortcut** — ⌃⌥M opens the popover from anywhere (configurable)
+  startles near a limit, celebrates a fresh reset (holds still with Reduce
+  Motion)
+- **Global shortcut** — ⌃⌥M opens the popover from anywhere (configurable);
+  inside the popover `r` refreshes, `1`/`2`/`3` toggle a provider's history,
+  `,` opens Settings, `q` quits
 - **Scriptable** — `MeowBar.app/Contents/MacOS/MeowBar --json` prints the
   cached numbers for shell prompts and scripts
 - **Popover detail** — plan name (`Plus`, `Pro · unlimited`), session + weekly
@@ -50,7 +57,8 @@ those numbers where they belong: always visible, always fresh, zero setup.
   tool if it has headroom ("Codex has 70% left")
 - **Update check** — once a day against `version.json` next to the DMG (set
   `MeowBarUpdateURL` in `Info.plist`; empty = off)
-- **Polite** — Liquid Glass popover, dismisses on any key or outside click
+- **Polite** — Liquid Glass popover, gear menu (Settings, updates, Quit),
+  dismisses on any key or outside click
 - **Persistent** — launch-at-login toggle in Settings
 - **Featherweight** — native Swift, ~100 MB RAM, 0% CPU idle
 
@@ -98,11 +106,13 @@ and upload `MeowBar.dmg` + `version.json` side by side.
 ## Files
 
 ```
-MeowBar/Sources/main.swift            app, menu bar, island panel, alert engine, store
+MeowBar/Sources/main.swift            app, menu bar (fill-meter icons), island panel, alerts, store
 MeowBar/Sources/UsageService.swift    credentials, providers, statusline bridge, session clock
-MeowBar/Sources/PopoverView.swift     popover UI, history strip, cat
+MeowBar/Sources/PopoverView.swift     popover UI, status header, history strip, cat, gear menu
+MeowBar/Sources/CatGlyph.swift        the cat silhouette — one vector mark, tinted everywhere
+MeowBar/Sources/PopoverShot.swift     MEOWBAR_POPOVER_SHOT — float the popover for screenshots
 MeowBar/Sources/SettingsView.swift    settings window
-MeowBar/Sources/OnboardingView.swift  first-launch window
+MeowBar/Sources/OnboardingView.swift  first-launch window (with a menu-bar mock)
 MeowBar/Sources/AppSupport.swift      on-disk cache/history, --json, update check
 MeowBar/Sources/HotKey.swift          global shortcut
 MeowBar/Sources/Core/                 pure logic (models, pace, history, clock) — unit-tested
@@ -110,3 +120,7 @@ Tests/MeowBarCoreTests/               swift test
 MeowBar/Sources/statusline/main.swift meowbar-statusline helper (Claude bridge)
 index.html                            landing page (self-contained, pairs with MeowBar.dmg)
 ```
+
+Tip: `MEOWBAR_DEMO=alerts MEOWBAR_POPOVER_SHOT=1 ./MeowBar.app/Contents/MacOS/MeowBar`
+floats a canned-data popover mid-screen for fresh screenshots (`preview.png`
+came from that).

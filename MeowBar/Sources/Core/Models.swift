@@ -110,27 +110,40 @@ extension UsageWindow {
         return min(1, max(0, (win - reset.timeIntervalSince(now)) / win))
     }
 
+    // Severity of the pace verdict, for coloring. Ordered: how worried the
+    // cat should be.
+    enum PaceSeverity: Int {
+        case none = 0   // silent — not enough signal, or no window
+        case good       // plenty left
+        case ok         // comfortable
+        case warn       // cutting it close
+        case bad        // will run out, or already maxed
+    }
+
     // Projected usage at reset (linear burn since the window opened) → a
-    // short verdict, worded as the guess it is. Silent until there's signal:
-    // 10% of the window gone (30 min of a 5h window, ~17h of a week) unless
-    // usage is already high — 3h into a week says little about Friday.
-    func paceVerdict(now: Date = Date()) -> String {
-        guard let win = windowSeconds, let reset = resetsAt else { return "" }
-        if usedPercent >= 100 { return "maxed" }
+    // short verdict + how alarming it is. Silent until there's signal: 10%
+    // of the window gone (30 min of a 5h window, ~17h of a week) unless usage
+    // is already high — 3h into a week says little about Friday.
+    private func pace(now: Date) -> (verdict: String, severity: PaceSeverity) {
+        guard let win = windowSeconds, let reset = resetsAt else { return ("", .none) }
+        if usedPercent >= 100 { return ("maxed", .bad) }
         let remaining = reset.timeIntervalSince(now)
         let elapsed = win - remaining
-        guard elapsed > 600, elapsed >= win * 0.1 || usedPercent >= 30 else { return "" }
+        guard elapsed > 600, elapsed >= win * 0.1 || usedPercent >= 30 else { return ("", .none) }
         let usedFrac = usedPercent / 100
         let projected = usedFrac * win / elapsed
         if projected >= 1 {
             let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
-            guard secondsToFull < remaining else { return "cutting it close" }
-            return "may run out in ~\(Countdown.rough(secondsToFull))"
+            guard secondsToFull < remaining else { return ("cutting it close", .warn) }
+            return ("may run out in ~\(Countdown.rough(secondsToFull))", .bad)
         }
-        if projected < 0.55 { return "plenty left" }
-        if projected < 0.85 { return "comfortable" }
-        return "cutting it close"
+        if projected < 0.55 { return ("plenty left", .good) }
+        if projected < 0.85 { return ("comfortable", .ok) }
+        return ("cutting it close", .warn)
     }
+
+    func paceVerdict(now: Date = Date()) -> String { pace(now: now).verdict }
+    func paceSeverity(now: Date = Date()) -> PaceSeverity { pace(now: now).severity }
 }
 
 enum Countdown {

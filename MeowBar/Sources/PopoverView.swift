@@ -6,9 +6,18 @@ private func supportingText(_ scheme: ColorScheme) -> Color {
     Color.primary.opacity(scheme == .dark ? 0.76 : 0.70)
 }
 
+private func successColor(_ scheme: ColorScheme) -> Color {
+    scheme == .dark
+        ? Color(red: 0.31, green: 0.93, blue: 0.55)
+        : Color(red: 0.00, green: 0.43, blue: 0.19)
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
     @Environment(\.colorScheme) private var colorScheme
+    // Expansion lives here so the 1/2/3 keys (posted from the keyDown
+    // monitor in main.swift) can toggle providers from outside the blocks.
+    @State private var expandedProviders: Set<String> = []
 
     @ViewBuilder
     var body: some View {
@@ -21,16 +30,25 @@ struct PopoverView: View {
         }
     }
 
+    private var providers: [ProviderUsage] {
+        var list = [store.claude, store.codex]
+        if store.devin.isVisible { list.append(store.devin) }
+        return list
+    }
+
     private var content: some View {
-        // Flat list, battery-menu style: no header, providers separated by
-        // hairline dividers only.
+        // Flat list, battery-menu style: slim status header, providers
+        // separated by hairline dividers, quiet footer.
         VStack(alignment: .leading, spacing: 9) {
-            ProviderBlock(usage: store.claude, running: store.claudeRunning, store: store)
+            header
             Divider()
-            ProviderBlock(usage: store.codex, running: store.codexRunning, store: store)
-            if store.devin.isVisible {
-                Divider()
-                ProviderBlock(usage: store.devin, running: store.devinRunning, store: store)
+            ForEach(Array(providers.enumerated()), id: \.offset) { i, usage in
+                if i > 0 { Divider() }
+                ProviderBlock(usage: usage,
+                              running: runningFlag(usage.name),
+                              store: store,
+                              expanded: expandedBinding(usage.name),
+                              delay: 0.04 + Double(i) * 0.05)
             }
             Divider()
             footer
@@ -38,40 +56,131 @@ struct PopoverView: View {
         .padding(12)
         .frame(width: 290)
         .foregroundStyle(.primary)
+        .onReceive(NotificationCenter.default.publisher(for: .init("meowbar.toggleProvider"))) { note in
+            guard let s = note.object as? String, let n = Int(s),
+                  providers.indices.contains(n - 1) else { return }
+            let name = providers[n - 1].name
+            guard providers[n - 1].hasData else { return }
+            withAnimation(.snappy(duration: 0.25)) {
+                if expandedProviders.contains(name) {
+                    expandedProviders.remove(name)
+                } else {
+                    expandedProviders.insert(name)
+                }
+            }
+        }
     }
 
-    private var footer: some View {
-        HStack(spacing: 6) {
-            CatView(mood: catMood, animating: store.popoverShown)
-            if let at = store.lastUpdated {
-                Text("updated \(Countdown.ago(at))")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(supportingText(colorScheme))
-            }
-            Spacer()
-            if let update = store.update, let url = UpdateCheck.downloadURL(update) {
-                Button("Update") { NSWorkspace.shared.open(url) }
-                    .controlSize(.small)
-                    .help("MeowBar \(update.version) is available" + (update.notes.map { " — \($0)" } ?? ""))
-            }
-            Button {
-                NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
-            } label: {
-                Image(systemName: "gearshape").font(.caption)
-            }
-            .controlSize(.small)
-            .buttonStyle(.borderless)
-            .help("Settings")
-            Button("Quit") { NSApp.terminate(nil) }.controlSize(.small)
+    private func runningFlag(_ name: String) -> Bool {
+        switch name {
+        case "Claude": return store.claudeRunning
+        case "Codex": return store.codexRunning
+        case "Devin": return store.devinRunning
+        default: return false
         }
+    }
+
+    private func expandedBinding(_ name: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedProviders.contains(name) },
+            set: { on in
+                if on { expandedProviders.insert(name) } else { expandedProviders.remove(name) }
+            })
+    }
+
+    // MARK: Header — the cat plus the one line you'd read first
+
+    private var header: some View {
+        HStack(spacing: 7) {
+            CatView(mood: catMood, animating: store.popoverShown)
+            Text(statusLine.text)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(statusLine.color)
+                .textCase(.uppercase)
+                .lineLimit(1)
+            Spacer()
+        }
+    }
+
+    // What the whole popover boils down to, worst news first.
+    private var statusLine: (text: String, color: Color) {
+        if let u = providers.first(where: { ($0.worstUsed ?? 0) >= 100 }) {
+            return ("\(u.name) maxed", .red)
+        }
+        if let u = providers.first(where: { ($0.worstUsed ?? 0) >= 90 }) {
+            return ("\(u.name) near the limit", .orange)
+        }
+        if let u = providers.first(where: { $0.action != nil }) {
+            return ("\(u.name) needs attention", .red)
+        }
+        if let until = store.celebrateUntil, until > Date() {
+            return ("Limits refreshed", successColor(colorScheme))
+        }
+        let running = [("Claude", store.claudeRunning), ("Codex", store.codexRunning),
+                       ("Devin", store.devinRunning)].filter(\.1)
+        if running.count == 1 { return ("\(running[0].0) is working", successColor(colorScheme)) }
+        if running.count > 1 { return ("\(running.count) agents working", successColor(colorScheme)) }
+        return ("All quiet", supportingText(colorScheme))
     }
 
     private var catMood: CatView.Mood {
-        if [store.claude, store.codex, store.devin].contains(where: { ($0.worstUsed ?? 0) >= 90 }) {
-            return .startled
-        }
+        if let until = store.celebrateUntil, until > Date() { return .celebrating }
+        if providers.contains(where: { ($0.worstUsed ?? 0) >= 90 }) { return .startled }
         if store.claudeRunning || store.codexRunning || store.devinRunning { return .working }
         return .napping
+    }
+
+    // MARK: Footer — freshness left, actions behind one gear
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            if let at = store.lastUpdated {
+                Text("Updated \(Countdown.ago(at))")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(supportingText(colorScheme))
+                    .textCase(.uppercase)
+            }
+            Spacer()
+            Button { store.refresh() } label: {
+                Image(systemName: "arrow.clockwise").font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Refresh now (r)")
+            settingsMenu
+        }
+    }
+
+    private var settingsMenu: some View {
+        Menu {
+            Button("Settings…") {
+                NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
+            }
+            .keyboardShortcut(",")
+            if let update = store.update, let url = UpdateCheck.downloadURL(update) {
+                Divider()
+                Button("Download MeowBar \(update.version)…") { NSWorkspace.shared.open(url) }
+            } else if UpdateCheck.feedURL != nil {
+                Button("Check for Updates…") {
+                    NotificationCenter.default.post(name: .init("meowbar.checkUpdates"), object: nil)
+                }
+            }
+            Divider()
+            Button("Quit MeowBar") { NSApp.terminate(nil) }
+                .keyboardShortcut("q")
+        } label: {
+            Image(systemName: "gearshape").font(.caption)
+                .overlay(alignment: .topTrailing) {
+                    if store.update != nil {
+                        Circle().fill(.red).frame(width: 5, height: 5).offset(x: 2.5, y: -2.5)
+                    }
+                }
+                .padding(2)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Settings and updates (q to quit)")
     }
 }
 
@@ -79,7 +188,9 @@ struct ProviderBlock: View {
     let usage: ProviderUsage
     var running: Bool = false
     var store: UsageStore? = nil
-    @State private var expanded = false
+    var expanded: Binding<Bool> = .constant(false)
+    var delay: Double = 0
+    @State private var appeared = false
     @Environment(\.colorScheme) private var colorScheme
 
     private var brandColor: Color {
@@ -94,12 +205,6 @@ struct ProviderBlock: View {
                 : Color(red: 0.00, green: 0.45, blue: 0.34)
         default: return .primary
         }
-    }
-
-    private var successColor: Color {
-        colorScheme == .dark
-            ? Color(red: 0.31, green: 0.93, blue: 0.55)
-            : Color(red: 0.00, green: 0.43, blue: 0.19)
     }
 
     private var providerIcon: NSImage? {
@@ -120,26 +225,29 @@ struct ProviderBlock: View {
                 let name = Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
                 if canExpand {
                     Button {
-                        withAnimation(.snappy(duration: 0.25)) { expanded.toggle() }
+                        withAnimation(.snappy(duration: 0.25)) { expanded.wrappedValue.toggle() }
                     } label: {
                         HStack(spacing: 4) {
                             name
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 8, weight: .semibold))
                                 .foregroundStyle(supportingText(colorScheme))
-                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                                .rotationEffect(.degrees(expanded.wrappedValue ? 90 : 0))
                         }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(expanded ? "Hide history" : "Show the last 7 days")
+                    .help(expanded.wrappedValue ? "Hide history" : "Show the last 7 days")
                 } else {
                     name
                 }
                 if running {
-                    Text("running")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(successColor)
+                    HStack(spacing: 3) {
+                        LiveDot(color: successColor(colorScheme), live: store?.popoverShown ?? false)
+                        Text("running")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(successColor(colorScheme))
+                    }
                 } else if usage.isStale, Date().timeIntervalSince(usage.fetchedAt) >= 60 {
                     Label(Countdown.ago(usage.fetchedAt), systemImage: "clock")
                         .labelStyle(.titleAndIcon)
@@ -154,7 +262,7 @@ struct ProviderBlock: View {
                             Text(note).foregroundStyle(.primary)
                         }
                         if let accent = usage.noteAccent {
-                            Text(accent).foregroundStyle(successColor)
+                            Text(accent).foregroundStyle(successColor(colorScheme))
                         }
                     }
                     .font(.caption2.weight(.semibold))
@@ -166,7 +274,7 @@ struct ProviderBlock: View {
                 }
             }
 
-            if expanded && canExpand {
+            if expanded.wrappedValue && canExpand {
                 HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
@@ -195,10 +303,46 @@ struct ProviderBlock: View {
                 WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
             }
         }
+        .opacity(appeared ? 1 : 0)
+        .offset(y: appeared ? 0 : 5)
+        .onAppear { if store?.popoverShown ?? true { replayEntrance() } else { appeared = true } }
+        .onChange(of: store?.popoverShown ?? false) { _, shown in
+            if shown { replayEntrance() } else { appeared = false }
+        }
+    }
+
+    // Brief rise-and-fade when the popover opens; each block waits a touch
+    // longer than the one before it (stagger via `delay`).
+    private func replayEntrance() {
+        appeared = false
+        withAnimation(.easeOut(duration: 0.26).delay(delay)) { appeared = true }
     }
 }
 
-// Last 7 days as a strip of day bars (today solid) plus the busiest hours.
+// The little pulsing dot next to "running". The repeating animation exists
+// only while `live` — the popover's view outlives the popover, and an
+// always-on pulse would burn CPU around the clock.
+private struct LiveDot: View {
+    let color: Color
+    var live: Bool
+    @State private var dim = false
+
+    var body: some View {
+        Circle().fill(color).frame(width: 4.5, height: 4.5)
+            .opacity(live && dim ? 0.3 : 1)
+            .onAppear { if live { pulse() } }
+            .onChange(of: live) { _, live in
+                if live { pulse() } else { dim = false }
+            }
+    }
+
+    private func pulse() {
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true }
+    }
+}
+
+// Last 7 days as a strip of day bars (today solid) plus the busiest hours
+// and how today compares to yesterday.
 struct HistoryStrip: View {
     let samples: [UsageSample]
     var tint: Color
@@ -235,6 +379,13 @@ struct HistoryStrip: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 1) {
                     Text("last 7 days")
+                    if days.count >= 2 {
+                        let delta = (days.last ?? 0) - days[days.count - 2]
+                        if abs(delta) >= 3 {
+                            Text("\(delta > 0 ? "↑" : "↓")\(Int(abs(delta).rounded()))% today")
+                                .help("Points of the \(unit) limit burned today vs. yesterday")
+                        }
+                    }
                     if let b = UsageHistory.busiestBlock(samples) {
                         Text("busiest \(UsageHistory.blockLabel(startHour: b))")
                     }
@@ -260,47 +411,45 @@ struct WindowRow: View {
 
     var body: some View {
         if let w {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .lastTextBaseline) {
                     Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText(colorScheme))
                     Spacer()
-                    (Text("\(Int(w.usedPercent))%").font(.caption.weight(.semibold))
-                        + Text(" used · \(Int(max(0, 100 - w.usedPercent)))% left")
-                        .font(.caption).foregroundStyle(supportingText(colorScheme)))
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(.easeOut(duration: 0.35), value: w.usedPercent)
+                    trailing
                 }
                 // Custom capsule bar — ProgressView.tint is neutralized inside
                 // the glass popover on macOS 26 and renders gray regardless.
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
-                        Capsule().fill(Color.primary.opacity(0.15))
-                        Capsule().fill(barColor)
+                        Capsule().fill(Color.primary.opacity(0.14))
+                            .overlay {
+                                Capsule().strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
+                            }
+                        Capsule().fill(barGradient)
                             .frame(width: max(0, geo.size.width * min(w.usedPercent, 100) / 100))
                             .animation(.spring(duration: 0.5, bounce: 0.15), value: w.usedPercent)
                         // Even-pace marker: where usage would sit if burned
                         // evenly. Fill past it = ahead of pace.
                         if let f = w.elapsedFraction(), f > 0.02, f < 0.98 {
-                            Capsule().fill(Color.primary.opacity(0.6))
-                                .frame(width: 2, height: 10)
-                                .offset(x: geo.size.width * f - 1)
+                            Capsule().fill(Color.primary.opacity(0.7))
+                                .frame(width: 2.5, height: 9)
+                                .offset(x: geo.size.width * f - 1.25)
                         }
                     }
                 }
-                .frame(height: 6)
+                .frame(height: 7)
                 .help(paceHelp)
                 HStack {
-                    Text(resetText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
+                    Text(bottomText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
                         .help(resetHelp)
                     Spacer()
-                    Text(w.paceVerdict()).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme))
+                    Text(w.paceVerdict()).font(.caption2.weight(.medium)).foregroundStyle(verdictColor)
                         .help("A guess from your pace so far in this window — it changes as you work")
                 }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(provider) \(title.replacingOccurrences(of: " · ", with: ", ")): "
-                + "\(Int(w.usedPercent)) percent used. \(resetText). \(w.paceVerdict())")
+                + "\(Int(max(0, 100 - w.usedPercent))) percent left. \(bottomText). \(w.paceVerdict())")
         } else {
             HStack {
                 Text(title).font(.caption.weight(.medium)).foregroundStyle(supportingText(colorScheme))
@@ -310,9 +459,58 @@ struct WindowRow: View {
         }
     }
 
+    // The glance-number: how much is LEFT, big and rounded. When the window
+    // is maxed the only useful number is the reset — that becomes the chip.
+    @ViewBuilder
+    private var trailing: some View {
+        if let w, w.usedPercent >= 100, let reset = w.resetsAt, reset > Date() {
+            Label(Countdown.compact(to: reset), systemImage: "arrow.clockwise")
+                .labelStyle(.titleAndIcon)
+                .font(.caption.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(.red)
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(Color.red.opacity(colorScheme == .dark ? 0.22 : 0.13), in: .capsule)
+                .help(resetHelp)
+        } else if let w {
+            (Text("\(Int(max(0, 100 - w.usedPercent)))%")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(barColor)
+                + Text(" left")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(supportingText(colorScheme)))
+            .monospacedDigit()
+            .contentTransition(.numericText())
+            .animation(.easeOut(duration: 0.35), value: w.usedPercent)
+        }
+    }
+
+    private var bottomText: String {
+        guard let w else { return "" }
+        if w.usedPercent == 0, w.resetsAt == nil { return resetText }
+        return ["\(Int(w.usedPercent))% used", resetText]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
     private var barColor: Color {
         guard let w else { return tint }
         return w.usedPercent >= 90 ? .red : w.usedPercent >= 75 ? .orange : tint
+    }
+
+    private var barGradient: LinearGradient {
+        LinearGradient(colors: [barColor.opacity(0.75), barColor],
+                       startPoint: .leading, endPoint: .trailing)
+    }
+
+    private var verdictColor: Color {
+        switch w?.paceSeverity() ?? .none {
+        case .none: return supportingText(colorScheme)
+        case .good: return successColor(colorScheme)
+        case .ok: return supportingText(colorScheme)
+        case .warn: return .orange
+        case .bad: return .red
+        }
     }
 
     private var resetText: String {
@@ -341,13 +539,13 @@ struct WindowRow: View {
 }
 
 // The mascot: naps when nothing's running, bounces while an agent works,
-// wiggles when a limit is close — a few cycles each time the popover opens,
-// then still. Never animates off screen: the popover's view outlives the
-// popover, and a running animation kept the app at 10–20% CPU around the
-// clock; when `animating` drops, the effects leave the view tree. Still under
-// Reduce Motion. (macOS 14: still.)
+// trembles near a limit, celebrates a fresh reset. Animates only while on
+// screen: the popover's view outlives the popover, and a running animation
+// kept the app at 10–20% CPU around the clock. When `animating` drops, the
+// effects are removed from the view tree, not just paused. Still under
+// Reduce Motion.
 struct CatView: View {
-    enum Mood { case napping, working, startled }
+    enum Mood { case napping, working, startled, celebrating }
     let mood: Mood
     var size: CGFloat = 13
     var animating = true
@@ -369,19 +567,29 @@ struct CatView: View {
 
     @ViewBuilder
     private var cat: some View {
-        let image = Image(systemName: "cat.fill")
-            .font(.system(size: size))
+        let image = Image(nsImage: CatGlyph.image(size: 32))
+            .renderingMode(.template)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size * 1.15, height: size * 1.05)
             .foregroundStyle(color)
-        // A few cycles each time the popover opens, then rest — looping
-        // effects cost ~10% CPU for as long as the popover stays open.
-        if live, #available(macOS 15.0, *) {
-            switch mood {
-            case .napping: image.symbolEffect(.breathe, options: .repeat(.periodic(2, delay: 0.4)))
-            case .working: image.symbolEffect(.bounce.up, options: .repeat(.periodic(4, delay: 0.3)))
-            case .startled: image.symbolEffect(.wiggle, options: .repeat(.periodic(3, delay: 0.8)))
-            }
-        } else {
+        if !live {
             image
+        } else {
+            switch mood {
+            case .napping:
+                image.phaseAnimator([0.96, 1.05]) { v, p in
+                    v.scaleEffect(p, anchor: .bottom)
+                }
+            case .working, .celebrating:
+                image.phaseAnimator([0.0, -0.22, 0.0]) { v, p in
+                    v.offset(y: p * size)
+                }
+            case .startled:
+                image.phaseAnimator([0.0, -4.0, 5.0, -3.0, 0.0]) { v, p in
+                    v.rotationEffect(.degrees(p))
+                }
+            }
         }
     }
 
@@ -390,14 +598,14 @@ struct CatView: View {
         case .napping: return "Napping — nothing running"
         case .working: return "Working — an agent is running"
         case .startled: return "Startled — a limit is close"
+        case .celebrating: return "A limit just reset"
         }
     }
 
     private var color: Color {
         switch mood {
         case .napping: return supportingText(colorScheme)
-        case .working: return colorScheme == .dark
-            ? Color(red: 0.31, green: 0.93, blue: 0.55) : Color(red: 0.00, green: 0.43, blue: 0.19)
+        case .working, .celebrating: return successColor(colorScheme)
         case .startled: return .orange
         }
     }
@@ -406,24 +614,45 @@ struct CatView: View {
     private var badge: some View {
         switch mood {
         case .napping:
-            // System symbol effect, not a SwiftUI repeatForever animation: the
-            // latter kept ticking after its view was removed (~6% CPU, closed).
-            let z = Image(systemName: "zzz")
-                .font(.system(size: size * 0.5, weight: .bold))
-                .foregroundStyle(supportingText(colorScheme))
-                .offset(x: size * 1.3, y: -size * 0.7)
-            if live, #available(macOS 15.0, *) {
-                z.symbolEffect(.variableColor.iterative.dimInactiveLayers, options: .repeat(.periodic(2, delay: 0.4)))
+            if live {
+                DriftingZ(size: size, color: supportingText(colorScheme))
             } else {
-                z
+                Text("z")
+                    .font(.system(size: size * 0.55, weight: .bold, design: .rounded))
+                    .foregroundStyle(supportingText(colorScheme))
+                    .offset(x: size * 1.4, y: -size * 0.6)
             }
         case .startled:
             Text("!")
                 .font(.system(size: size * 0.7, weight: .heavy, design: .rounded))
                 .foregroundStyle(.orange)
                 .offset(x: size * 1.5, y: -size * 0.55)
+        case .celebrating:
+            Image(systemName: "sparkle")
+                .font(.system(size: size * 0.6, weight: .bold))
+                .foregroundStyle(successColor(colorScheme))
+                .offset(x: size * 1.45, y: -size * 0.55)
         case .working:
             EmptyView()
         }
+    }
+}
+
+// A "z" drifting up and fading, on repeat. Its own view so the repeating
+// animation dies with it when the cat stops animating.
+private struct DriftingZ: View {
+    let size: CGFloat
+    let color: Color
+    @State private var drifting = false
+
+    var body: some View {
+        Text("z")
+            .font(.system(size: size * 0.55, weight: .bold, design: .rounded))
+            .foregroundStyle(color)
+            .opacity(drifting ? 0 : 0.9)
+            .offset(x: size * (drifting ? 1.7 : 1.4), y: -size * (drifting ? 1.1 : 0.6))
+            .onAppear {
+                withAnimation(.easeOut(duration: 2.6).repeatForever(autoreverses: false)) { drifting = true }
+            }
     }
 }

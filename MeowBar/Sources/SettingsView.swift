@@ -7,6 +7,7 @@ extension Notification.Name {
 }
 
 struct SettingsView: View {
+    @ObservedObject var store: UsageStore
     @AppStorage("meowbar.position") var position = "right"     // right | middle
     @AppStorage("meowbar.displayMode") var displayMode = "percent" // percent | countdown
     @AppStorage("meowbar.alwaysFresh") var alwaysFresh = false
@@ -19,6 +20,7 @@ struct SettingsView: View {
     @AppStorage("meowbar.hotkey") var hotkey = HotKey.defaultID
     @State private var bridgeError: String? = nil
     @State private var bridgeInstalled = false
+    @State private var checkingUpdate = false
 
     var body: some View {
         Form {
@@ -68,6 +70,42 @@ struct SettingsView: View {
                 Picker("Open MeowBar with", selection: $hotkey) {
                     Text("Off").tag("off")
                     ForEach(HotKey.choices, id: \.id) { Text($0.combo.label).tag($0.id) }
+                }
+            }
+
+            Section("About") {
+                HStack {
+                    Text("Version")
+                    Spacer()
+                    Text(UpdateCheck.currentVersion)
+                        .foregroundStyle(.secondary)
+                }
+                if let update = store.update, let url = UpdateCheck.downloadURL(update) {
+                    HStack {
+                        Text("MeowBar \(update.version) is available")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Download…") { NSWorkspace.shared.open(url) }
+                    }
+                } else if UpdateCheck.feedURL != nil {
+                    HStack {
+                        Button(checkingUpdate ? "Checking…" : "Check for Updates…") {
+                            checkingUpdate = true
+                            NotificationCenter.default.post(name: .init("meowbar.checkUpdates"), object: nil)
+                            // The feed allows 15s; if nothing new was found
+                            // by then, stop spinning and say so.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 16) {
+                                checkingUpdate = false
+                            }
+                        }
+                        .disabled(checkingUpdate)
+                        if checkingUpdate {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Checks daily, automatically")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
         }
