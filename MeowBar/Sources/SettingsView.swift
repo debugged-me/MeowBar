@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage("meowbar.alert90") var alert90 = true
     @AppStorage("meowbar.alert95") var alert95 = true
     @AppStorage("meowbar.alertReset") var alertReset = true
+    @AppStorage("meowbar.meowSound") var meowSound = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
     @AppStorage("meowbar.autoClock") var autoClock = true
     @AppStorage("meowbar.hotkey") var hotkey = HotKey.defaultID
@@ -45,6 +46,7 @@ struct SettingsView: View {
                 Toggle("Nudge at 90% used", isOn: $alert90)
                 Toggle("Nudge at 95% used", isOn: $alert95)
                 Toggle("When a limit resets", isOn: $alertReset)
+                Toggle("Meow when a limit resets", isOn: $meowSound)
             }
 
             Section("Claude") {
@@ -129,6 +131,7 @@ struct SettingsView: View {
         .onChange(of: alert90) { changed() }
         .onChange(of: alert95) { changed() }
         .onChange(of: alertReset) { changed() }
+        .onChange(of: meowSound) { changed() }
         .onChange(of: autoClock) { changed() }
         .onChange(of: hotkey) { changed() }
         .onChange(of: launchAtLogin) { applyLoginItem() }

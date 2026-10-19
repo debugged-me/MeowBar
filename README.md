@@ -30,7 +30,7 @@
 [What it shows](#what-it-shows) | [Install](#install) | [Make it yours](#make-it-yours) | [Tips](#tips) | [Troubleshooting](#troubleshooting)
 
 <p align="center">
-  <img src="preview.png" alt="The MeowBar popover: Claude maxed, Codex running" width="600">
+  <img src="demo.gif" alt="MeowBar in action: limits, pace verdicts, history" width="560">
 </p>
 
 ## Why

@@ -153,6 +153,7 @@ final class UsageStore: ObservableObject {
                     for (a, b) in [(old.session, u.session), (old.weekly, u.weekly)]
                     where (a?.usedPercent ?? 0) - (b?.usedPercent ?? 0) >= 40 {
                         self.celebrateUntil = now.addingTimeInterval(60)
+                        MeowSound.play()
                     }
                 }
                 self.lastUpdated = now
@@ -384,6 +385,21 @@ final class UsageStore: ObservableObject {
             return "\(u.name): " + (nums.isEmpty ? (u.error ?? "…") : nums)
         }
         return [line(claude), line(codex)].joined(separator: "    ")
+    }
+}
+
+// The little celebration chirp when a limit window resets — off by default,
+// Settings → Alerts → "Meow when a limit resets". Bundled synth, plays once.
+enum MeowSound {
+    private static var sound: NSSound?
+
+    static func play() {
+        guard UserDefaults.standard.bool(forKey: "meowbar.meowSound") else { return }
+        if sound == nil {
+            sound = Bundle.main.url(forResource: "meow", withExtension: "caf")
+                .flatMap { NSSound(contentsOf: $0, byReference: false) }
+        }
+        sound?.play()
     }
 }
 
