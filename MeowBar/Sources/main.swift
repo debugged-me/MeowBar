@@ -215,7 +215,8 @@ final class UsageStore: ObservableObject {
                 string: " " + metric,
                 attributes: [
                     .foregroundColor: color,
-                    .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+                    // Tabular digits: 98% → 97% shouldn't nudge the item's width.
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
                 ]))
 
             let status: String?
@@ -274,6 +275,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // AND fires the action — without this guard the click reopens instead of
     // closing. 0.4s is below human double-tap speed for a deliberate reopen.
     private var popoverClosedAt = Date.distantPast
+    // The view the popover's arrow points at: the status button, or the
+    // island capsule in "middle" mode.
+    private weak var popoverAnchor: NSView?
     let store = UsageStore()
     private var settingsWindow: NSWindow?
     private var islandPanel: NSPanel?
@@ -326,6 +330,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard self?.popover.isShown == true else { return event }
             self?.popover.performClose(nil)
             return nil
+        }
+
+        // The status item changes width constantly (" · running", alerts,
+        // countdown text, and acknowledging an alert on click). The bar moves
+        // the item's window a beat after the button resizes, and NSPopover
+        // doesn't follow — the arrow ends up pointing at empty menu bar.
+        // Re-anchor whenever the anchor's window moves or resizes.
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil,
+                                                   queue: .main) { [weak self] note in
+                guard let self, let anchor = self.popoverAnchor, self.popover.isShown,
+                      (note.object as? NSWindow) === anchor.window else { return }
+                self.popover.positioningRect = anchor.bounds
+            }
         }
     }
 
@@ -412,9 +430,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.acknowledgeAlerts()
         store.refresh()
         if let bg = islandPanel?.contentView, islandPanel?.isVisible == true {
-            popover.show(relativeTo: bg.bounds, of: bg, preferredEdge: .minY)
-        } else if let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popoverAnchor = bg
+        } else {
+            popoverAnchor = statusItem.button
+        }
+        if let anchor = popoverAnchor {
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
         }
         // The popover window is a non-activating panel: makeKey() gives it
         // key status WITHOUT activating our app — the front app keeps its
