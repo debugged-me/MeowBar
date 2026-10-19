@@ -14,6 +14,7 @@
   <img alt="Apple Silicon" src="https://img.shields.io/badge/Apple%20Silicon-M--series-555555?style=flat-square">
   <img alt="Version 1.2" src="https://img.shields.io/badge/version-1.2-4FB29E?style=flat-square">
   <img alt="Swift" src="https://img.shields.io/badge/code-Swift-F05138?style=flat-square">
+  <img alt="MIT code" src="https://img.shields.io/badge/license-MIT-74B087?style=flat-square">
 </p>
 
 <p align="center">
@@ -22,7 +23,7 @@
   · <a href="https://github.com/debugged-me/MeowBar/issues">Report a bug</a>
 </p>
 
-> **macOS 14+ · Apple Silicon · v1.2.** The app is **ad-hoc signed** —
+> **macOS 14+ · Apple Silicon · v1.3.** The app is **ad-hoc signed** —
 > macOS will warn once on first launch: right-click → **Open**, or
 > System Settings → Privacy & Security → Open Anyway.
 > [Build from source](#build-and-run)
@@ -45,7 +46,8 @@ the credentials your CLI tools already stored on your Mac (Keychain for Claude,
 
 | Platform | Availability |
 | --- | --- |
-| macOS 14+, Apple Silicon | [Download v1.2](https://github.com/debugged-me/MeowBar/releases/latest/download/MeowBar.dmg) |
+| macOS 14+, Apple Silicon | [Download v1.3](https://github.com/debugged-me/MeowBar/releases/latest/download/MeowBar.dmg) |
+| Homebrew | `brew tap debugged-me/meowbar` → `brew trust debugged-me/meowbar` → `brew install --cask meowbar` |
 | Intel Macs | Not supported (Apple Silicon only) |
 
 1. [Download MeowBar.dmg](https://github.com/debugged-me/MeowBar/releases/latest/download/MeowBar.dmg), open it, drag **MeowBar** to **Applications**.
