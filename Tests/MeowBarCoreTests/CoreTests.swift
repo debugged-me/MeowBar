@@ -60,11 +60,30 @@ final class WindowTests: XCTestCase {
         // 1h into a 5h window
         let reset = now.addingTimeInterval(4 * 3600)
         XCTAssertEqual(UsageWindow(usedPercent: 5, resetsAt: reset, windowSeconds: 18000).paceVerdict(now: now), "plenty left")
-        XCTAssertEqual(UsageWindow(usedPercent: 40, resetsAt: reset, windowSeconds: 18000).paceVerdict(now: now), "hit limit in 1h 30m")
+        XCTAssertEqual(UsageWindow(usedPercent: 40, resetsAt: reset, windowSeconds: 18000).paceVerdict(now: now), "may run out in ~1h 30m")
         XCTAssertEqual(UsageWindow(usedPercent: 100, resetsAt: reset, windowSeconds: 18000).paceVerdict(now: now), "maxed")
         // first 10 minutes: too early to call
         let early = now.addingTimeInterval(18000 - 300)
         XCTAssertEqual(UsageWindow(usedPercent: 5, resetsAt: early, windowSeconds: 18000).paceVerdict(now: now), "")
+    }
+
+    func testWeeklyPaceWaitsForSignal() {
+        // 3h into a week at 5%: a straight line says "out in ~2.5 days" — too little to go on.
+        let reset = now.addingTimeInterval(604800 - 3 * 3600)
+        XCTAssertEqual(UsageWindow(usedPercent: 5, resetsAt: reset, windowSeconds: 604800).paceVerdict(now: now), "")
+        // …unless usage is already high.
+        XCTAssertEqual(UsageWindow(usedPercent: 40, resetsAt: reset, windowSeconds: 604800).paceVerdict(now: now), "may run out in ~4h 30m")
+        // 2 days in at 50%: on track to run out a day early.
+        let later = now.addingTimeInterval(604800 - 2 * 86400)
+        XCTAssertEqual(UsageWindow(usedPercent: 50, resetsAt: later, windowSeconds: 604800).paceVerdict(now: now), "may run out in ~2d")
+    }
+
+    func testRoughDurations() {
+        XCTAssertEqual(Countdown.rough(60), "5m")
+        XCTAssertEqual(Countdown.rough(33 * 60), "35m")
+        XCTAssertEqual(Countdown.rough(111 * 60), "1h 45m")
+        XCTAssertEqual(Countdown.rough(40 * 3600), "1d 18h")
+        XCTAssertEqual(Countdown.rough(86000), "1d")
     }
 }
 
@@ -183,6 +202,35 @@ final class HistoryTests: XCTestCase {
         XCTAssertEqual(UsageHistory.blockLabel(startHour: 10), "10 AM–1 PM")
         XCTAssertEqual(UsageHistory.blockLabel(startHour: 23), "11 PM–2 AM")
         XCTAssertEqual(UsageHistory.blockLabel(startHour: 0), "12–3 AM")
+    }
+}
+
+final class DevinActivityTests: XCTestCase {
+    typealias Row = DevinActivity.Row
+
+    func testRunningToolKeepsTurnActiveThroughLongSilences() {
+        let rows = [Row(kind: "tool_call", status: "in_progress"), Row(kind: "agent_thought")]
+        XCTAssertTrue(DevinActivity.isActive(rows: rows, quietFor: 600))
+        // A just-started tool call has no status yet.
+        XCTAssertTrue(DevinActivity.isActive(rows: [Row(kind: "tool_call", status: nil)], quietFor: 120))
+    }
+
+    func testMidTurnToleratesThinkingGaps() {
+        let rows = [Row(kind: "agent_thought"), Row(kind: "tool_call", status: "completed")]
+        XCTAssertTrue(DevinActivity.isActive(rows: rows, quietFor: 30))
+        XCTAssertFalse(DevinActivity.isActive(rows: rows, quietFor: 60))
+    }
+
+    func testFinalMessageEndsTurnSooner() {
+        let rows = [Row(kind: "agent_message"), Row(kind: "tool_call", status: "completed")]
+        XCTAssertTrue(DevinActivity.isActive(rows: rows, quietFor: 5))
+        XCTAssertFalse(DevinActivity.isActive(rows: rows, quietFor: 25))
+    }
+
+    func testFailedToolDoesNotCountAsRunning() {
+        let rows = [Row(kind: "agent_message"), Row(kind: "tool_call", status: "failed")]
+        XCTAssertFalse(DevinActivity.isActive(rows: rows, quietFor: 30))
+        XCTAssertFalse(DevinActivity.isActive(rows: [], quietFor: 0))
     }
 }
 

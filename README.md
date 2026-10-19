@@ -23,7 +23,7 @@ those numbers where they belong: always visible, always fresh, zero setup.
   MeowBar launches `claude` briefly so it renews itself; error states carry
   action buttons (`Run codex login in Terminal`, `Open Devin`, …)
 - **Pace verdicts** — `plenty left` / `comfortable` / `cutting it close` /
-  `hit limit in …` projected from the window's burn rate, plus an even-pace
+  `may run out in ~…` — a rounded guess from the window's burn rate, silent until there's enough signal, plus an even-pace
   marker on every bar (fill past the tick = ahead of pace)
 - **Auto-started session clock** — Claude's 5-hour window only opens on your
   first message; when it's idle and you're at your Mac, MeowBar opens it with

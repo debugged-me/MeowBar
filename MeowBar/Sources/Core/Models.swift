@@ -98,19 +98,21 @@ extension UsageWindow {
     }
 
     // Projected usage at reset (linear burn since the window opened) → a
-    // one-word verdict. Empty for the first 10 min of a window — too noisy.
+    // short verdict, worded as the guess it is. Silent until there's signal:
+    // 10% of the window gone (30 min of a 5h window, ~17h of a week) unless
+    // usage is already high — 3h into a week says little about Friday.
     func paceVerdict(now: Date = Date()) -> String {
         guard let win = windowSeconds, let reset = resetsAt else { return "" }
         if usedPercent >= 100 { return "maxed" }
         let remaining = reset.timeIntervalSince(now)
         let elapsed = win - remaining
-        guard elapsed > 600 else { return "" }
+        guard elapsed > 600, elapsed >= win * 0.1 || usedPercent >= 30 else { return "" }
         let usedFrac = usedPercent / 100
         let projected = usedFrac * win / elapsed
         if projected >= 1 {
             let secondsToFull = (1 - usedFrac) * elapsed / max(usedFrac, 0.001)
             guard secondsToFull < remaining else { return "cutting it close" }
-            return "hit limit \(Countdown.long(to: now.addingTimeInterval(secondsToFull), now: now))"
+            return "may run out in ~\(Countdown.rough(secondsToFull))"
         }
         if projected < 0.55 { return "plenty left" }
         if projected < 0.85 { return "comfortable" }
@@ -135,6 +137,23 @@ enum Countdown {
         if d > 0 { return "\(d)d\(h)h" }
         if h > 0 { return "\(h)h\(m)m" }
         return m > 0 ? "\(m)m" : "<1m"
+    }
+
+    // Coarse durations for projections — no false precision: 5-min steps
+    // under an hour, 15-min steps under a day, 6-hour steps beyond.
+    static func rough(_ seconds: TimeInterval) -> String {
+        let s = max(0, seconds)
+        if s < 3600 {
+            let m = max(5, Int((s / 300).rounded()) * 5)
+            return m >= 60 ? "1h" : "\(m)m"
+        }
+        if s < 86400 {
+            let q = Int((s / 900).rounded()), h = q / 4, m = (q % 4) * 15
+            if h >= 24 { return "1d" }
+            return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+        }
+        let h6 = Int((s / 21600).rounded()) * 6, d = h6 / 24, h = h6 % 24
+        return h == 0 ? "\(d)d" : "\(d)d \(h)h"
     }
 
     // "just now" / "4m ago" / "2h ago" — footer freshness.

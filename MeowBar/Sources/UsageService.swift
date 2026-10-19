@@ -475,6 +475,53 @@ private final class ClaudeTurnTracker: @unchecked Sendable {
 
 private let claudeTurnTracker = ClaudeTurnTracker()
 
+// Devin app turns, read from User/acp-messages/<session>.db (one row per
+// streamed ACP update; rules in Core/DevinActivity.swift). Only sessions
+// written in the last 15 min are opened, read-only.
+private final class DevinTurnTracker: @unchecked Sendable {
+    private let dir = NSHomeDirectory() + "/Library/Application Support/Devin/User/acp-messages"
+    private let lock = NSLock()
+
+    func hasActiveTurn() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let fm = FileManager.default, now = Date()
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return false }
+        var recent: [(path: String, written: Date)] = []
+        for name in names where name.hasSuffix(".db") {
+            let path = dir + "/" + name
+            // WAL mode: rows land in the -wal file first.
+            let written = [path, path + "-wal"]
+                .compactMap { (try? fm.attributesOfItem(atPath: $0))?[.modificationDate] as? Date }
+                .max() ?? .distantPast
+            if now.timeIntervalSince(written) < 15 * 60 { recent.append((path, written)) }
+        }
+        for s in recent.sorted(by: { $0.written > $1.written }).prefix(3)
+            where DevinActivity.isActive(rows: latestRows(s.path), quietFor: now.timeIntervalSince(s.written)) {
+            return true
+        }
+        return false
+    }
+
+    private func latestRows(_ path: String) -> [DevinActivity.Row] {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return [] }
+        var stmt: OpaquePointer?
+        let sql = "SELECT kind, json_extract(payload, '$.content.status') FROM messages ORDER BY position DESC LIMIT 5"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var rows: [DevinActivity.Row] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            rows.append(DevinActivity.Row(
+                kind: sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "",
+                status: sqlite3_column_text(stmt, 1).map { String(cString: $0) }))
+        }
+        return rows
+    }
+}
+
+private let devinTurnTracker = DevinTurnTracker()
+
 private func codexIDEHasActiveTask() -> Bool {
     let codexHome = NSHomeDirectory() + "/.codex"
     let fm = FileManager.default
@@ -521,17 +568,19 @@ private func loadDevinCredential() throws -> DevinCredential {
 enum UsageService {
 
     // True when the claude/codex/devin CLI process exists and is burning CPU
-    // (an idle REPL sits ~0%); heuristic for "a task is actually running".
-    // Names are matched case-sensitively so the "Devin" IDE app (capital D)
-    // doesn't count — only the lowercase `devin` CLI harness does.
+    // (an idle REPL sits ~0%), or its local transcript shows a turn in
+    // flight. The CPU check matches case-sensitively so the "Devin" IDE app
+    // (capital D, busy with UI) doesn't count — its agent turns come from the
+    // ACP session log instead.
     static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool) {
         // ucomm is the executable name on macOS; comm is a truncated path and
         // can hide `codex`/`claude` when they live inside an editor extension.
         let (_, out) = runProcess("/bin/ps", ["-A", "-o", "pid=", "-o", "%cpu=", "-o", "ucomm="])
         let codexTurnActive = codexIDEHasActiveTask()
         let claudeTurnActive = claudeTurnTracker.hasActiveTurn()
+        let devinTurnActive = devinTurnTracker.hasActiveTurn()
         var c = false, x = false, d = false
-        var claudeExists = false, codexExists = false
+        var claudeExists = false, codexExists = false, devinExists = false
         for line in out.split(separator: "\n") {
             let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
             guard parts.count >= 3, let pid = Int32(parts[0]),
@@ -543,6 +592,7 @@ enum UsageService {
             if meowbarSpawned.contains(pid) { continue }
             if executable == "claude" { claudeExists = true }
             if executable == "codex" { codexExists = true }
+            if executable == "devin" || executable == "Devin" { devinExists = true }
             guard cpu > 1.5 else { continue }
             switch executable {
             case "claude": c = true
@@ -553,6 +603,7 @@ enum UsageService {
         }
         c = c || (claudeExists && claudeTurnActive)
         x = x || (codexExists && codexTurnActive)
+        d = d || (devinExists && devinTurnActive)
         return (c, x, d)
     }
 

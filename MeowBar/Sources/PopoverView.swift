@@ -295,6 +295,7 @@ struct WindowRow: View {
                         .help(resetHelp)
                     Spacer()
                     Text(w.paceVerdict()).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme))
+                        .help("A guess from your pace so far in this window — it changes as you work")
                 }
             }
             .accessibilityElement(children: .ignore)
