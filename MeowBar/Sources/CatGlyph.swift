@@ -7,6 +7,7 @@ import AppKit
 // menu bar.
 enum CatGlyph {
     private static var cache: [Int: NSImage] = [:]
+    private static var tintCache: [String: NSImage] = [:]
 
     static func image(size: CGFloat) -> NSImage {
         let key = Int(size * 2)
@@ -27,12 +28,43 @@ enum CatGlyph {
                 e.close()
                 p.append(e)
             }
+            // December: a floppy hat over the right ear, bobble and all.
+            // Drawn into the same silhouette, so it tints with the cat.
+            if Calendar.current.component(.month, from: Date()) == 12 {
+                let hat = NSBezierPath()
+                hat.move(to: NSPoint(x: w * 0.56, y: h * 0.60))
+                hat.curve(to: NSPoint(x: w * 0.97, y: h * 0.86),
+                          controlPoint1: NSPoint(x: w * 0.66, y: h * 0.97),
+                          controlPoint2: NSPoint(x: w * 0.86, y: h * 0.95))
+                hat.line(to: NSPoint(x: w * 0.84, y: h * 0.50))
+                hat.close()
+                p.append(hat)
+                p.appendOval(in: NSRect(x: w * 0.93, y: h * 0.80,
+                                        width: w * 0.11, height: w * 0.11))
+            }
             NSColor.black.setFill()
             p.fill()
             return true
         }
         img.isTemplate = true
         cache[key] = img
+        return img
+    }
+
+    // The silhouette drawn in a specific color — for attributed-string
+    // attachments, which can't take a template image's ambient tint.
+    static func tinted(size: CGFloat, _ color: NSColor) -> NSImage {
+        let key = "\(size)-\(color.description)"
+        if let img = tintCache[key] { return img }
+        let base = image(size: size)
+        let img = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        img.isTemplate = false
+        tintCache[key] = img
         return img
     }
 }

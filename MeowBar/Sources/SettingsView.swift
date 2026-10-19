@@ -16,6 +16,9 @@ struct SettingsView: View {
     @AppStorage("meowbar.alert95") var alert95 = true
     @AppStorage("meowbar.alertReset") var alertReset = true
     @AppStorage("meowbar.meowSound") var meowSound = false
+    @AppStorage("meowbar.purrSound") var purrSound = false
+    @AppStorage("meowbar.compact") var compact = false
+    @AppStorage("meowbar.trot") var trot = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
     @AppStorage("meowbar.autoClock") var autoClock = true
     @AppStorage("meowbar.hotkey") var hotkey = HotKey.defaultID
@@ -42,6 +45,20 @@ struct SettingsView: View {
                     Text("Shows how long until the limit runs out at your current pace — ~2h means you'd hit it in about 2 hours. When you're not on pace to run out, it falls back to the reset countdown.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Toggle(isOn: $compact) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Compact — just the cat")
+                        Text("One cat silhouette tinted by your worst window: gray, orange near a limit, red at the wall.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Toggle(isOn: $trot) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Trot while agents work")
+                        Text("A little cat bob in the menu bar whenever an agent is running. Off keeps the bar perfectly still.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Section("Alerts") {
@@ -50,6 +67,7 @@ struct SettingsView: View {
                 Toggle("Nudge at 95% used", isOn: $alert95)
                 Toggle("When a limit resets", isOn: $alertReset)
                 Toggle("Meow when a limit resets", isOn: $meowSound)
+                Toggle("Purr when a task finishes", isOn: $purrSound)
             }
 
             Section("Claude") {
@@ -136,6 +154,9 @@ struct SettingsView: View {
         .onChange(of: alert95) { changed() }
         .onChange(of: alertReset) { changed() }
         .onChange(of: meowSound) { changed() }
+        .onChange(of: purrSound) { changed() }
+        .onChange(of: compact) { changed() }
+        .onChange(of: trot) { changed() }
         .onChange(of: autoClock) { changed() }
         .onChange(of: hotkey) { changed() }
         .onChange(of: launchAtLogin) { applyLoginItem() }

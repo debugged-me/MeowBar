@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 // Derive from the semantic foreground instead of a fixed gray. It remains
 // legible when the glass moves over light, dark, or tinted UI.
@@ -154,6 +155,9 @@ struct PopoverView: View {
 
     private var settingsMenu: some View {
         Menu {
+            Button("About MeowBar") {
+                NotificationCenter.default.post(name: .init("meowbar.openAbout"), object: nil)
+            }
             Button("Settings…") {
                 NotificationCenter.default.post(name: .init("meowbar.openSettings"), object: nil)
             }
@@ -255,6 +259,13 @@ struct ProviderBlock: View {
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(supportingText(colorScheme))
                         .help("Last numbers MeowBar got — it keeps retrying")
+                }
+                if let today = UsageHistory.dailyBurn(store?.history[usage.name] ?? [], days: 1).last,
+                   today >= 0.5 {
+                    Text("+\(Int(today.rounded())) today")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(supportingText(colorScheme))
+                        .help("Points of the limit burned today")
                 }
                 Spacer()
                 if usage.note != nil || usage.noteAccent != nil {
@@ -420,9 +431,11 @@ struct HistoryStrip: View {
 }
 
 // A thin line chart — used for the last-24h burn inside expanded history.
+// Hover scrubs: a dot rides the line with a "3h ago · +8" readout.
 private struct Sparkline: View {
     let values: [Double]
     var tint: Color
+    @State private var hover: Int?
 
     var body: some View {
         GeometryReader { geo in
@@ -433,20 +446,41 @@ private struct Sparkline: View {
                 CGPoint(x: CGFloat(i) * stepX,
                         y: h - 1.5 - (h - 3) * CGFloat(v / peak))
             }
-            Path { p in
-                guard let first = pts.first else { return }
-                p.move(to: CGPoint(x: first.x, y: h - 1))
-                for pt in pts { p.addLine(to: pt) }
-                p.addLine(to: CGPoint(x: pts.last?.x ?? first.x, y: h - 1))
-                p.closeSubpath()
+            ZStack {
+                Path { p in
+                    guard let first = pts.first else { return }
+                    p.move(to: CGPoint(x: first.x, y: h - 1))
+                    for pt in pts { p.addLine(to: pt) }
+                    p.addLine(to: CGPoint(x: pts.last?.x ?? first.x, y: h - 1))
+                    p.closeSubpath()
+                }
+                .fill(tint.opacity(0.18))
+                Path { p in
+                    guard let first = pts.first else { return }
+                    p.move(to: first)
+                    for pt in pts.dropFirst() { p.addLine(to: pt) }
+                }
+                .stroke(tint.opacity(0.9), lineWidth: 1.2)
+                if let i = hover, pts.indices.contains(i) {
+                    Circle().fill(tint).frame(width: 5, height: 5)
+                        .position(pts[i])
+                    let ago = values.count - 1 - i
+                    Text("\(ago == 0 ? "now" : "\(ago)h ago") · +\(Int(values[i].rounded()))")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(tint)
+                        .position(x: min(max(pts[i].x, 32), w - 32), y: 4)
+                }
             }
-            .fill(tint.opacity(0.18))
-            Path { p in
-                guard let first = pts.first else { return }
-                p.move(to: first)
-                for pt in pts.dropFirst() { p.addLine(to: pt) }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let p):
+                    hover = min(values.count - 1,
+                                max(0, Int((p.x / w) * CGFloat(values.count))))
+                case .ended:
+                    hover = nil
+                }
             }
-            .stroke(tint.opacity(0.9), lineWidth: 1.2)
         }
     }
 }
@@ -601,12 +635,15 @@ struct CatView: View {
     var animating = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
+    @State private var blinking = false
+    // A quick eyelid squash every few seconds — the cheapest life there is.
+    private let blinker = Timer.publish(every: 3.8, on: .main, in: .common).autoconnect()
 
     private var live: Bool { animating && !reduceMotion }
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            cat
+            catWithBlink
             badge
         }
         .frame(width: size * 2.2, height: size * 1.5, alignment: .bottomLeading)
@@ -640,6 +677,21 @@ struct CatView: View {
                     v.rotationEffect(.degrees(p))
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var catWithBlink: some View {
+        cat
+            .scaleEffect(y: blinking ? 0.12 : 1, anchor: .center)
+            .onReceive(blinker) { _ in blink() }
+    }
+
+    private func blink() {
+        guard live else { return }
+        withAnimation(.easeIn(duration: 0.07)) { blinking = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
+            withAnimation(.easeOut(duration: 0.12)) { blinking = false }
         }
     }
 

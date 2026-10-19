@@ -153,7 +153,7 @@ final class UsageStore: ObservableObject {
                     for (a, b) in [(old.session, u.session), (old.weekly, u.weekly)]
                     where (a?.usedPercent ?? 0) - (b?.usedPercent ?? 0) >= 40 {
                         self.celebrateUntil = now.addingTimeInterval(60)
-                        MeowSound.play()
+                        CatSound.play(.mew)
                     }
                 }
                 self.lastUpdated = now
@@ -243,6 +243,7 @@ final class UsageStore: ObservableObject {
                                ("Devin", activity.devin)] {
                     if self.recordActivity(for: sample.0, isBusy: sample.1) {
                         self.arm(sample.0, "task done", now: now)
+                        CatSound.play(.purr)
                         self.refresh() // the finished task just moved the numbers
                     }
                 }
@@ -295,24 +296,61 @@ final class UsageStore: ObservableObject {
     // Loaded once — the menu title is rebuilt every 2s.
     private var iconCache: [String: NSImage] = [:]
 
-    private func iconImage(_ resource: String) -> NSImage? {
-        if let img = iconCache[resource] { return img }
+    private func iconImage(_ resource: String, dimmed: Bool = false) -> NSImage? {
+        let key = dimmed ? "\(resource)-dim" : resource
+        if let img = iconCache[key] { return img }
         guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
-              let img = NSImage(contentsOf: url) else { return nil }
+              let base = NSImage(contentsOf: url) else { return nil }
+        let img: NSImage
+        if dimmed {
+            // Stale data reads at half strength — ambient "not fresh" signal.
+            img = NSImage(size: base.size, flipped: false) { r in
+                base.draw(in: r, from: .zero, operation: .sourceOver, fraction: 0.5)
+                return true
+            }
+        } else {
+            img = base
+        }
         img.size = NSSize(width: 16, height: 16)
-        iconCache[resource] = img
+        iconCache[key] = img
         return img
     }
 
+    private var trotPhase = false
+
     var menuTitle: NSAttributedString {
+        let ud = UserDefaults.standard
+        let trotting = ud.bool(forKey: "meowbar.trot")
+            && (claudeRunning || codexRunning || devinRunning)
+        var catY: CGFloat = -3.4
+        if trotting {
+            trotPhase.toggle()
+            catY = trotPhase ? -3.4 : -2.2
+        }
+
+        // Compact mode: one cat silhouette tinted by the worst window —
+        // gray calm, orange near a limit, red at the wall.
+        if ud.bool(forKey: "meowbar.compact") {
+            let worst = [claude, codex, devin].compactMap(\.worstUsed).max()
+            let color: NSColor = worst == nil ? .secondaryLabelColor
+                : worst! >= 90 ? .systemRed : worst! >= 75 ? .systemOrange : .labelColor
+            let s = NSMutableAttributedString()
+            let att = NSTextAttachment()
+            att.image = CatGlyph.tinted(size: 16, color)
+            att.bounds = CGRect(x: 0, y: catY, width: 16, height: 14.7)
+            s.append(NSAttributedString(attachment: att))
+            return s
+        }
+
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
         func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
-                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool) -> NSAttributedString {
+                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool,
+                   _ stale: Bool = false) -> NSAttributedString {
             let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
-            if let img = iconImage(resource) {
+            if let img = iconImage(resource, dimmed: stale) {
                 let att = NSTextAttachment()
                 att.image = img
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
@@ -366,11 +404,21 @@ final class UsageStore: ObservableObject {
             return s
         }
         let t = NSMutableAttributedString()
+        if trotting {
+            // The trot: a cat head bobs beside the numbers while agents work.
+            let att = NSTextAttachment()
+            att.image = CatGlyph.tinted(size: 15, .labelColor)
+            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 13.8)
+            t.append(NSAttributedString(attachment: att))
+            t.append(NSAttributedString(string: "  "))
+        }
         t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
-                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
+                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning,
+                       claude.isStale))
         t.append(NSAttributedString(string: "   "))
         t.append(entry("codex", "Codex", codex.displayLeft, codex.worstUsed,
-                       codex.displayReset, codex.displayTimeToEmpty, codexRunning))
+                       codex.displayReset, codex.displayTimeToEmpty, codexRunning,
+                       codex.isStale))
         return t
     }
 
@@ -388,18 +436,24 @@ final class UsageStore: ObservableObject {
     }
 }
 
-// The little celebration chirp when a limit window resets — off by default,
-// Settings → Alerts → "Meow when a limit resets". Bundled synth, plays once.
-enum MeowSound {
-    private static var sound: NSSound?
+// The little celebration chirps — a mew when a limit window resets, a soft
+// purr when an agent's task finishes. Both off by default (Settings → Alerts).
+// Bundled synths, played once per trigger.
+enum CatSound {
+    enum Kind: String {
+        case mew = "meowbar.meowSound"
+        case purr = "meowbar.purrSound"
+        var resource: String { self == .mew ? "meow" : "purr" }
+    }
+    private static var sounds: [Kind: NSSound] = [:]
 
-    static func play() {
-        guard UserDefaults.standard.bool(forKey: "meowbar.meowSound") else { return }
-        if sound == nil {
-            sound = Bundle.main.url(forResource: "meow", withExtension: "caf")
+    static func play(_ kind: Kind) {
+        guard UserDefaults.standard.bool(forKey: kind.rawValue) else { return }
+        if sounds[kind] == nil {
+            sounds[kind] = Bundle.main.url(forResource: kind.resource, withExtension: "caf")
                 .flatMap { NSSound(contentsOf: $0, byReference: false) }
         }
-        sound?.play()
+        sounds[kind]?.play()
     }
 }
 
@@ -420,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var popoverAnchor: NSView?
     let store = UsageStore()
     private var settingsWindow: NSWindow?
+    private var aboutWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private let hotKey = HotKey()
     private var islandPanel: NSPanel?
@@ -465,7 +520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Sound test: MEOWBAR_MEOW=1 plays once through the real code path
         // (needs the Settings toggle on, like a real reset).
         if ProcessInfo.processInfo.environment["MEOWBAR_MEOW"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MeowSound.play() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { CatSound.play(.mew) }
         }
         // Screenshot aid: open the real Settings window (MEOWBAR_SETTINGS_SHOT).
         if ProcessInfo.processInfo.environment["MEOWBAR_SETTINGS_SHOT"] != nil {
@@ -485,6 +540,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: .init("meowbar.checkUpdates"),
                                                object: nil, queue: .main) { [weak self] _ in
             self?.store.checkForUpdate()
+        }
+        NotificationCenter.default.addObserver(forName: .init("meowbar.openAbout"),
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.openAbout()
         }
 
         // .transient is unreliable for accessory apps — explicitly close on
@@ -630,6 +689,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func openAbout() {
+        if aboutWindow == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: AboutView()))
+            w.title = "About MeowBar"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.level = .floating
+            aboutWindow = w
+        }
+        aboutWindow?.center()
+        aboutWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     // MARK: Positions — right (status item) or middle ("island" at top edge)
 
     func applyPosition() {
@@ -740,6 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(head)
         menu.addItem(.separator())
         menu.addItem(item("Refresh Now", #selector(menuRefresh)))
+        menu.addItem(item("About MeowBar", #selector(menuAbout)))
         menu.addItem(item("Settings…", #selector(menuSettings)))
         if let update = store.update, UpdateCheck.downloadURL(update) != nil {
             menu.addItem(.separator())
@@ -754,6 +828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func menuRefresh() { store.refresh() }
     @objc private func menuSettings() { openSettings() }
+    @objc private func menuAbout() { openAbout() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
     @objc private func menuCheckUpdates() { store.checkForUpdate() }
     @objc private func menuDownloadUpdate() {
