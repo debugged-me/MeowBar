@@ -309,17 +309,8 @@ final class UsageStore: ObservableObject {
     }
 
 
-    private var trotPhase = false
-
     var menuTitle: NSAttributedString {
         let ud = UserDefaults.standard
-        let trotting = ud.bool(forKey: "meowbar.trot")
-            && (claudeRunning || codexRunning || devinRunning)
-        var catY: CGFloat = -3.4
-        if trotting {
-            trotPhase.toggle()
-            catY = trotPhase ? -3.4 : -2.2
-        }
 
         // Compact mode: the cat mark tinted by the worst window, then
         // each provider's % left in small type — the minimal readout.
@@ -332,7 +323,7 @@ final class UsageStore: ObservableObject {
             att.image = CatGlyph.tintedImage(
                 CatGlyph.image(size: 15), catColor,
                 key: "compact-\(catColor.description)")
-            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 13.8)
+            att.bounds = CGRect(x: 0, y: -3.4, width: 15, height: 13.8)
             s.append(NSAttributedString(attachment: att))
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
@@ -415,17 +406,6 @@ final class UsageStore: ObservableObject {
             return s
         }
         let t = NSMutableAttributedString()
-        if trotting {
-            // The trot: the cat mark bobs beside the numbers while
-            // agents work, alternating on the existing 2s tick.
-            let att = NSTextAttachment()
-            att.image = CatGlyph.tintedImage(
-                CatGlyph.image(size: 14), .labelColor,
-                key: "trot-\(trotPhase)")
-            att.bounds = CGRect(x: 0, y: catY, width: 14, height: 12.9)
-            t.append(NSAttributedString(attachment: att))
-            t.append(NSAttributedString(string: "  "))
-        }
         t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
                        claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
         t.append(NSAttributedString(string: "   "))

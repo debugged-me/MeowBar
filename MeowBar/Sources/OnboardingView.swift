@@ -52,6 +52,10 @@ struct OnboardingView: View {
                 option($launchAtLogin, "Launch at login", nil)
             }
 
+            Text("Optional cat sounds — a meow on reset, a meow on task done, a sad mewl when a limit maxes — live in Settings → Alerts. Off until you want them.")
+                .font(.caption).foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
             HStack {
                 Spacer()
                 Button("Get started") {

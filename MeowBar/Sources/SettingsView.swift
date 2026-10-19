@@ -19,7 +19,6 @@ struct SettingsView: View {
     @AppStorage("meowbar.purrSound") var purrSound = false
     @AppStorage("meowbar.sadSound") var sadSound = false
     @AppStorage("meowbar.compact") var compact = false
-    @AppStorage("meowbar.trot") var trot = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
     @AppStorage("meowbar.autoClock") var autoClock = true
     @AppStorage("meowbar.hotkey") var hotkey = HotKey.defaultID
@@ -50,13 +49,6 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Compact — cat and small percentages")
                         Text("The cat mark tinted by your worst window plus each provider's % left in small type — the minimal readout.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Toggle(isOn: $trot) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Trot while agents work")
-                        Text("A little cat bob in the menu bar whenever an agent is running. Off keeps the bar perfectly still.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -159,7 +151,6 @@ struct SettingsView: View {
         .onChange(of: purrSound) { changed() }
         .onChange(of: sadSound) { changed() }
         .onChange(of: compact) { changed() }
-        .onChange(of: trot) { changed() }
         .onChange(of: autoClock) { changed() }
         .onChange(of: hotkey) { changed() }
         .onChange(of: launchAtLogin) { applyLoginItem() }
