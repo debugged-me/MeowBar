@@ -17,6 +17,7 @@ struct SettingsView: View {
     @AppStorage("meowbar.alertReset") var alertReset = true
     @AppStorage("meowbar.meowSound") var meowSound = false
     @AppStorage("meowbar.purrSound") var purrSound = false
+    @AppStorage("meowbar.sadSound") var sadSound = false
     @AppStorage("meowbar.compact") var compact = false
     @AppStorage("meowbar.trot") var trot = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
@@ -67,7 +68,8 @@ struct SettingsView: View {
                 Toggle("Nudge at 95% used", isOn: $alert95)
                 Toggle("When a limit resets", isOn: $alertReset)
                 Toggle("Meow when a limit resets", isOn: $meowSound)
-                Toggle("Purr when a task finishes", isOn: $purrSound)
+                Toggle("Meow when a task finishes", isOn: $purrSound)
+                Toggle("Sad meow when a limit maxes", isOn: $sadSound)
             }
 
             Section("Claude") {
@@ -155,6 +157,7 @@ struct SettingsView: View {
         .onChange(of: alertReset) { changed() }
         .onChange(of: meowSound) { changed() }
         .onChange(of: purrSound) { changed() }
+        .onChange(of: sadSound) { changed() }
         .onChange(of: compact) { changed() }
         .onChange(of: trot) { changed() }
         .onChange(of: autoClock) { changed() }

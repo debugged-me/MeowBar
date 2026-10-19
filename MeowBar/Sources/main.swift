@@ -162,9 +162,12 @@ final class UsageStore: ObservableObject {
                     let prevW = self.prevWorst[u.name] ?? -1
                     if let w = worst { self.prevWorst[u.name] = w }
                     if let w = worst, w >= 90, prevW < 90 {
-                        self.arm(u.name, (pct ?? 0) <= 0 ? "limit reached" : "nearing limit", now: now)
+                        let text = (pct ?? 0) <= 0 ? "limit reached" : "nearing limit"
+                        self.arm(u.name, text, now: now)
+                        if text == "limit reached" { CatSound.play(.sad) }
                     } else if (pct ?? 1) <= 0, self.alertText[u.name] == "nearing limit" {
                         self.arm(u.name, "limit reached", now: now)
+                        CatSound.play(.sad)
                     }
                 }
                 Notifier.evaluate(self.claude, others: [self.codex])
@@ -243,7 +246,7 @@ final class UsageStore: ObservableObject {
                                ("Devin", activity.devin)] {
                     if self.recordActivity(for: sample.0, isBusy: sample.1) {
                         self.arm(sample.0, "task done", now: now)
-                        CatSound.play(.purr)
+                        CatSound.play(.done)
                         self.refresh() // the finished task just moved the numbers
                     }
                 }
@@ -445,21 +448,28 @@ final class UsageStore: ObservableObject {
     }
 }
 
-// The little celebration chirps — a mew when a limit window resets, a soft
-// purr when an agent's task finishes. Both off by default (Settings → Alerts).
-// Bundled synths, played once per trigger.
+// Real cat sounds, three moments: a meow when a limit window resets, a
+// short meow when an agent's task finishes, a sad mewl when a limit maxes.
+// All off by default (Settings → Alerts).
 enum CatSound {
     enum Kind: String {
         case mew = "meowbar.meowSound"
-        case purr = "meowbar.purrSound"
-        var resource: String { self == .mew ? "meow" : "purr" }
+        case done = "meowbar.purrSound"
+        case sad = "meowbar.sadSound"
+        var resource: String {
+            switch self {
+            case .mew: return "cat-meow"
+            case .done: return "meow"
+            case .sad: return "sad-cat"
+            }
+        }
     }
     private static var sounds: [Kind: NSSound] = [:]
 
     static func play(_ kind: Kind) {
         guard UserDefaults.standard.bool(forKey: kind.rawValue) else { return }
         if sounds[kind] == nil {
-            sounds[kind] = Bundle.main.url(forResource: kind.resource, withExtension: "caf")
+            sounds[kind] = Bundle.main.url(forResource: kind.resource, withExtension: "mp3")
                 .flatMap { NSSound(contentsOf: $0, byReference: false) }
         }
         sounds[kind]?.play()
