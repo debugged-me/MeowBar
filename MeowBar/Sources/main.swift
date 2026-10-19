@@ -318,7 +318,7 @@ final class UsageStore: ObservableObject {
             catY = trotPhase ? -3.4 : -2.2
         }
 
-        // Compact mode: a walking cat tinted by the worst window, then
+        // Compact mode: the cat mark tinted by the worst window, then
         // each provider's % left in small type — the minimal readout.
         if ud.bool(forKey: "meowbar.compact") {
             let worst = [claude, codex, devin].compactMap(\.worstUsed).max()
@@ -327,9 +327,9 @@ final class UsageStore: ObservableObject {
             let s = NSMutableAttributedString()
             let att = NSTextAttachment()
             att.image = CatGlyph.tintedImage(
-                CatGlyph.bodyImage(size: 13, stride: trotting ? trotPhase : true),
-                catColor, key: "compact-\(trotPhase)-\(catColor.description)")
-            att.bounds = CGRect(x: 0, y: catY, width: 19.5, height: 13)
+                CatGlyph.image(size: 15), catColor,
+                key: "compact-\(catColor.description)")
+            att.bounds = CGRect(x: 0, y: catY, width: 15, height: 13.8)
             s.append(NSAttributedString(attachment: att))
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
@@ -380,8 +380,9 @@ final class UsageStore: ObservableObject {
                 string: " " + metric,
                 attributes: [
                     .foregroundColor: color,
-                    // Tabular digits: 98% → 97% shouldn't nudge the item's width.
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+                    // Tabular digits a touch under menu-bar size: 98% → 97%
+                    // stays quiet and never nudges the item's width.
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .medium),
                 ]))
 
             let status: String?
@@ -412,13 +413,13 @@ final class UsageStore: ObservableObject {
         }
         let t = NSMutableAttributedString()
         if trotting {
-            // The trot: a walking cat whose legs actually alternate with
-            // each rebuild — two stride poses, not just a bob.
+            // The trot: the cat mark bobs beside the numbers while
+            // agents work, alternating on the existing 2s tick.
             let att = NSTextAttachment()
             att.image = CatGlyph.tintedImage(
-                CatGlyph.bodyImage(size: 12, stride: trotPhase),
-                .labelColor, key: "trot-\(trotPhase)")
-            att.bounds = CGRect(x: 0, y: catY, width: 18, height: 12)
+                CatGlyph.image(size: 14), .labelColor,
+                key: "trot-\(trotPhase)")
+            att.bounds = CGRect(x: 0, y: catY, width: 14, height: 12.9)
             t.append(NSAttributedString(attachment: att))
             t.append(NSAttributedString(string: "  "))
         }
