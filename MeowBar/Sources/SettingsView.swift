@@ -123,8 +123,7 @@ struct SettingsView: View {
             .padding(4)
         }
         .scrollContentBackground(.hidden)
-        .frame(width: 420)
-        .frame(maxHeight: 620)
+        .frame(width: 420, height: 620)
         .onAppear {
             bridgeInstalled = StatuslineBridge.isInstalled
             alwaysFresh = bridgeInstalled // reflect real state, even if enabled elsewhere

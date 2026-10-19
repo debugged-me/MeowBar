@@ -467,6 +467,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["MEOWBAR_MEOW"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { MeowSound.play() }
         }
+        // Screenshot aid: open the real Settings window (MEOWBAR_SETTINGS_SHOT).
+        if ProcessInfo.processInfo.environment["MEOWBAR_SETTINGS_SHOT"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.openSettings() }
+        }
         NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applyPosition()
