@@ -189,7 +189,11 @@ struct WindowRow: View {
     }
 
     private var resetText: String {
-        guard let reset = w?.resetsAt else { return "" }
+        // Claude's 5h window only opens on the first message — while idle the
+        // API reports 0% with resets_at: null, so there's no clock to count.
+        guard let reset = w?.resetsAt else {
+            return (w?.usedPercent ?? 0) == 0 ? "starts on first message" : ""
+        }
         if reset <= Date() { return "resetting now" }
         return "resets \(Notifier.countdown(to: reset))"
     }
