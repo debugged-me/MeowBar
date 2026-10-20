@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import Combine
 
 // Derive from the semantic foreground instead of a fixed gray. It remains
 // legible when the glass moves over light, dark, or tinted UI.
@@ -14,15 +13,43 @@ private func successColor(_ scheme: ColorScheme) -> Color {
         : Color(red: 0.00, green: 0.43, blue: 0.19)
 }
 
+// One curve for every popover resize: SwiftUI animates the layout with it
+// and PopoverHostingController animates the window with it, so the glass
+// edge and the content below it move as one.
+enum PopoverMotion {
+    static let duration: TimeInterval = 0.25
+    private static let curve: (Float, Float, Float, Float) = (0.25, 0.1, 0.25, 1.0)
+    static let resize = Animation.timingCurve(Double(curve.0), Double(curve.1),
+                                              Double(curve.2), Double(curve.3),
+                                              duration: duration)
+    static var timingFunction: CAMediaTimingFunction {
+        CAMediaTimingFunction(controlPoints: curve.0, curve.1, curve.2, curve.3)
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
+    // Natural size, reported on every layout change; AppDelegate sizes the
+    // popover from it (animated while open).
+    var onSizeChange: (CGSize) -> Void = { _ in }
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     // Expansion lives here so the 1/2/3 keys (posted from the keyDown
     // monitor in main.swift) can toggle providers from outside the blocks.
     @State private var expandedProviders: Set<String> = []
 
-    @ViewBuilder
     var body: some View {
+        surface
+            // Natural height, pinned to the top: while the popover window
+            // glides to a new height, any slack is at the bottom edge where
+            // the motion is — content is never re-centered or squeezed.
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { onSizeChange($0) }
+            .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private var surface: some View {
         if #available(macOS 26.0, *) {
             // Keep the surface untinted so Liquid Glass can sample the desktop.
             // Semantic foreground colours below retain contrast as it changes.
@@ -39,31 +66,26 @@ struct PopoverView: View {
     }
 
     private var content: some View {
-        // Flat list, battery-menu style: slim status header, providers
-        // separated by hairline dividers, quiet footer.
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 8) {
             header
-            Divider()
             ForEach(Array(providers.enumerated()), id: \.offset) { i, usage in
-                if i > 0 { Divider() }
                 ProviderBlock(usage: usage,
                               running: runningFlag(usage.name),
                               store: store,
                               expanded: expandedBinding(usage.name),
                               delay: 0.04 + Double(i) * 0.05)
             }
-            Divider()
             footer
         }
-        .padding(12)
-        .frame(width: 290)
+        .padding(10)
+        .frame(width: 304)
         .foregroundStyle(.primary)
         .onReceive(NotificationCenter.default.publisher(for: .init("meowbar.toggleProvider"))) { note in
             guard let s = note.object as? String, let n = Int(s),
                   providers.indices.contains(n - 1) else { return }
             let name = providers[n - 1].name
             guard providers[n - 1].hasData else { return }
-            withAnimation(.snappy(duration: 0.25)) {
+            withAnimation(reduceMotion ? nil : PopoverMotion.resize) {
                 if expandedProviders.contains(name) {
                     expandedProviders.remove(name)
                 } else {
@@ -93,14 +115,33 @@ struct PopoverView: View {
     // MARK: Header — the cat plus the one line you'd read first
 
     private var header: some View {
-        HStack(spacing: 7) {
-            CatView(mood: catMood, animating: store.popoverShown)
-            Text(statusLine.text)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(statusLine.color)
-                .textCase(.uppercase)
-                .lineLimit(1)
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(statusLine.color.opacity(colorScheme == .dark ? 0.18 : 0.10))
+                CatView(mood: catMood, size: 15, animating: store.popoverShown)
+                    .offset(x: 4)
+            }
+            .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(statusLine.text)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(statusLine.color)
+                    .lineLimit(1)
+                Text("Live usage and pace")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(supportingText(colorScheme))
+            }
             Spacer()
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(colorScheme == .dark ? 0.075 : 0.045),
+                    in: .rect(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(statusLine.color.opacity(0.18), lineWidth: 0.7)
         }
     }
 
@@ -148,13 +189,18 @@ struct PopoverView: View {
             }
             Spacer()
             Button { store.refresh() } label: {
-                Image(systemName: "arrow.clockwise").font(.caption)
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 22, height: 22)
+                    .background(Color.primary.opacity(0.07), in: .circle)
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
             .controlSize(.small)
             .help("Refresh now (r)")
             settingsMenu
         }
+        .padding(.horizontal, 3)
+        .padding(.top, 2)
     }
 
     private var settingsMenu: some View {
@@ -178,7 +224,10 @@ struct PopoverView: View {
             Button("Quit MeowBar") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
         } label: {
-            Image(systemName: "gearshape").font(.caption)
+            Image(systemName: "gearshape")
+                .font(.caption.weight(.semibold))
+                .frame(width: 22, height: 22)
+                .background(Color.primary.opacity(0.07), in: .circle)
                 .overlay(alignment: .topTrailing) {
                     if store.update != nil {
                         Circle().fill(.red).frame(width: 5, height: 5).offset(x: 2.5, y: -2.5)
@@ -200,7 +249,9 @@ struct ProviderBlock: View {
     var expanded: Binding<Bool> = .constant(false)
     var delay: Double = 0
     @State private var appeared = false
+    @State private var hovering = false
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var brandColor: Color {
         switch usage.name {
@@ -244,13 +295,17 @@ struct ProviderBlock: View {
                 if let icon = providerIcon {
                     Image(nsImage: icon).renderingMode(.template)
                         .resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 13, height: 13)
-                        .foregroundStyle(.primary)
+                        .frame(width: 12, height: 12)
+                        .foregroundStyle(brandColor)
+                        .frame(width: 22, height: 22)
+                        .background(brandColor.opacity(colorScheme == .dark ? 0.17 : 0.10), in: .circle)
                 }
                 let name = Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
                 if canExpand {
                     Button {
-                        withAnimation(.snappy(duration: 0.25)) { expanded.wrappedValue.toggle() }
+                        withAnimation(reduceMotion ? nil : PopoverMotion.resize) {
+                            expanded.wrappedValue.toggle()
+                        }
                     } label: {
                         HStack(spacing: 4) {
                             name
@@ -317,7 +372,7 @@ struct ProviderBlock: View {
 
             if expanded.wrappedValue && canExpand {
                 HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
             }
 
             if let err = usage.error {
@@ -340,9 +395,20 @@ struct ProviderBlock: View {
             if !unlimited && (usage.hasData || usage.error == nil) {
                 let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
                 WindowRow(provider: usage.name, title: sessionLabel, w: usage.session, tint: brandColor,
-                          clockStarting: usage.name == "Claude" && store?.clockStarting == true)
-                WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor)
+                          clockStarting: usage.name == "Claude" && store?.clockStarting == true,
+                          animating: store?.popoverShown == true)
+                WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor,
+                          animating: store?.popoverShown == true)
             }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(Color.primary.opacity(hovering ? 0.090 : (colorScheme == .dark ? 0.060 : 0.035)),
+                    in: .rect(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(running ? brandColor.opacity(0.34) : Color.primary.opacity(0.09),
+                              lineWidth: running ? 1 : 0.6)
         }
         .contextMenu {
             if let action = openAction {
@@ -360,11 +426,17 @@ struct ProviderBlock: View {
         .onChange(of: store?.popoverShown ?? false) { _, shown in
             if shown { replayEntrance() } else { appeared = false }
         }
+        .onHover { hovering = $0 }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovering)
     }
 
     // Brief rise-and-fade when the popover opens; each block waits a touch
     // longer than the one before it (stagger via `delay`).
     private func replayEntrance() {
+        guard !reduceMotion else {
+            appeared = true
+            return
+        }
         appeared = false
         withAnimation(.easeOut(duration: 0.26).delay(delay)) { appeared = true }
     }
@@ -376,19 +448,17 @@ struct ProviderBlock: View {
 private struct LiveDot: View {
     let color: Color
     var live: Bool
-    @State private var dim = false
-
     var body: some View {
-        Circle().fill(color).frame(width: 4.5, height: 4.5)
-            .opacity(live && dim ? 0.3 : 1)
-            .onAppear { if live { pulse() } }
-            .onChange(of: live) { _, live in
-                if live { pulse() } else { dim = false }
-            }
-    }
-
-    private func pulse() {
-        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true }
+        if live {
+            Circle().fill(color).frame(width: 4.5, height: 4.5)
+                .phaseAnimator([1.0, 0.3]) { dot, opacity in
+                    dot.opacity(opacity)
+                } animation: { _ in
+                    .easeInOut(duration: 0.9)
+                }
+        } else {
+            Circle().fill(color).frame(width: 4.5, height: 4.5)
+        }
     }
 }
 
@@ -529,7 +599,9 @@ struct WindowRow: View {
     let w: UsageWindow?
     var tint: Color = .accentColor
     var clockStarting = false
+    var animating = true
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if let w {
@@ -549,7 +621,8 @@ struct WindowRow: View {
                             }
                         Capsule().fill(barGradient)
                             .frame(width: max(0, geo.size.width * min(w.usedPercent, 100) / 100))
-                            .animation(.spring(duration: 0.5, bounce: 0.15), value: w.usedPercent)
+                            .animation(animating && !reduceMotion ? .spring(duration: 0.5, bounce: 0.15) : nil,
+                                       value: w.usedPercent)
                         // Even-pace marker: where usage would sit if burned
                         // evenly. Fill past it = ahead of pace.
                         if let f = w.elapsedFraction(), f > 0.02, f < 0.98 {
@@ -559,7 +632,7 @@ struct WindowRow: View {
                         }
                     }
                 }
-                .frame(height: 7)
+                .frame(height: 8)
                 .help(paceHelp)
                 HStack {
                     Text(bottomText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
@@ -603,7 +676,8 @@ struct WindowRow: View {
                 .foregroundStyle(supportingText(colorScheme)))
             .monospacedDigit()
             .contentTransition(.numericText())
-            .animation(.easeOut(duration: 0.35), value: w.usedPercent)
+            .animation(animating && !reduceMotion ? .easeOut(duration: 0.35) : nil,
+                       value: w.usedPercent)
         }
     }
 
@@ -676,8 +750,6 @@ struct CatView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     @State private var blinking = false
-    // A quick eyelid squash every few seconds — the cheapest life there is.
-    private let blinker = Timer.publish(every: 3.8, on: .main, in: .common).autoconnect()
 
     private var live: Bool { animating && !reduceMotion }
 
@@ -724,15 +796,26 @@ struct CatView: View {
     private var catWithBlink: some View {
         cat
             .scaleEffect(y: blinking ? 0.12 : 1, anchor: .center)
-            .onReceive(blinker) { _ in blink() }
+            .task(id: live) {
+                guard live else {
+                    blinking = false
+                    return
+                }
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(3.8))
+                    guard !Task.isCancelled else { return }
+                    await blink()
+                }
+            }
     }
 
-    private func blink() {
+    @MainActor
+    private func blink() async {
         guard live else { return }
         withAnimation(.easeIn(duration: 0.07)) { blinking = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
-            withAnimation(.easeOut(duration: 0.12)) { blinking = false }
-        }
+        try? await Task.sleep(for: .milliseconds(90))
+        guard !Task.isCancelled else { return }
+        withAnimation(.easeOut(duration: 0.12)) { blinking = false }
     }
 
     private var caption: String {
