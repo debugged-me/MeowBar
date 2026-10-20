@@ -345,18 +345,20 @@ final class UsageStore: ObservableObject {
 
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
-        func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
-                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool,
-                   _ stale: Bool = false) -> NSAttributedString {
+        func entry(_ resource: String, _ pct: Double?, _ sev: Double?,
+                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool) -> NSAttributedString {
             let color: NSColor = sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             if let img = iconImage(resource) {
                 let att = NSTextAttachment()
-                // Single-ink glyph, tinted like the metric it introduces —
-                // menu-bar icons read monochrome (Drive-style), not brand art.
+                // While the provider is working the glyph breathes between its
+                // severity ink and a faint mono ghost — a blink, not a banner.
+                // Swaps on the 2s activity tick, so it costs nothing at idle.
+                let dim = running && Int(Date().timeIntervalSinceReferenceDate / 2) % 2 == 1
+                let iconColor = dim ? NSColor.labelColor.withAlphaComponent(0.4) : color
                 att.image = CatGlyph.tintedImage(
-                    img, color, key: "\(resource)-\(color.description)")
+                    img, iconColor, key: "\(resource)-\(dim ? "dim" : color.description)")
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }
@@ -382,37 +384,13 @@ final class UsageStore: ObservableObject {
                     .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .medium),
                 ]))
 
-            let status: String?
-            let statusColor: NSColor
-            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
-                status = alert
-                switch alert {
-                case "task done": statusColor = .systemGreen
-                case "nearing limit": statusColor = .systemOrange
-                default: statusColor = .systemRed
-                }
-            } else if running {
-                status = "running"
-                statusColor = .systemGreen
-            } else {
-                status = nil
-                statusColor = .labelColor
-            }
-            if let status {
-                s.append(NSAttributedString(
-                    string: " · \(status)",
-                    attributes: [
-                        .foregroundColor: statusColor,
-                        .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
-                    ]))
-            }
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("claude", "Claude", claude.displayLeft, claude.worstUsed,
+        t.append(entry("claude", claude.displayLeft, claude.worstUsed,
                        claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
         t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", "Codex", codex.displayLeft, codex.worstUsed,
+        t.append(entry("codex", codex.displayLeft, codex.worstUsed,
                        codex.displayReset, codex.displayTimeToEmpty, codexRunning))
         return t
     }
