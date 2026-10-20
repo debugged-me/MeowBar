@@ -10,6 +10,8 @@ final class UsageStore: ObservableObject {
     @Published var claudeRunning = false
     @Published var codexRunning = false
     @Published var devinRunning = false
+    // Newest write to a Devin session log — shown as "last active" in the popover.
+    @Published var devinLastActive: Date?
     @Published var lastUpdated: Date?
     @Published var history: [String: [UsageSample]] = [:]
     @Published var clockStarting = false
@@ -38,7 +40,7 @@ final class UsageStore: ObservableObject {
     private var idleSamples: [String: Int] = [:]
     private var confirmedRunning: [String: Bool] = [:]
     private var prevWorst: [String: Double] = [:]
-    private let alertTTL: TimeInterval = 15
+    private let alertTTL: TimeInterval = 6
     private var demoActive = false
 
     func start() {
@@ -170,9 +172,10 @@ final class UsageStore: ObservableObject {
                         CatSound.play(.sad)
                     }
                 }
-                Notifier.evaluate(self.claude, others: [self.codex])
-                Notifier.evaluate(self.codex, others: [self.claude])
-                Notifier.evaluate(self.devin)
+                let working = self.claudeRunning || self.codexRunning || self.devinRunning
+                Notifier.evaluate(self.claude, others: [self.codex], active: working)
+                Notifier.evaluate(self.codex, others: [self.claude], active: working)
+                Notifier.evaluate(self.devin, active: working)
                 self.persist(now: now)
                 self.maybeStartClock(now: now)
                 self.onUpdate?()
@@ -244,11 +247,21 @@ final class UsageStore: ObservableObject {
                 for sample in [("Claude", activity.claude),
                                ("Codex", activity.codex),
                                ("Devin", activity.devin)] {
+                    let wasRunning = self.confirmedRunning[sample.0] == true
                     if self.recordActivity(for: sample.0, isBusy: sample.1) {
                         self.arm(sample.0, "task done", now: now)
                         CatSound.play(.done)
                         self.refresh() // the finished task just moved the numbers
+                    } else if !wasRunning, self.confirmedRunning[sample.0] == true,
+                              (self.alertUntil[sample.0] ?? .distantPast) <= now {
+                        // A blip, not a badge: "running" lands when work starts
+                        // and fades on its own — no fade-pulse, it's not an alert.
+                        self.alertText[sample.0] = "running"
+                        self.alertUntil[sample.0] = now.addingTimeInterval(self.alertTTL)
                     }
+                }
+                if let last = activity.devinLastActive, last != self.devinLastActive {
+                    self.devinLastActive = last
                 }
                 // Publish only changes: every assignment re-renders the
                 // popover's view graph, even while it's closed.
@@ -309,6 +322,13 @@ final class UsageStore: ObservableObject {
     }
 
 
+    // Per-provider visibility toggles (Settings → Menu bar), default on.
+    private func shownInMenuBar(_ u: ProviderUsage) -> Bool {
+        let key = u.name == "Claude" ? "meowbar.showClaude" : "meowbar.showCodex"
+        let ud = UserDefaults.standard
+        return ud.object(forKey: key) == nil || ud.bool(forKey: key)
+    }
+
     var menuTitle: NSAttributedString {
         let ud = UserDefaults.standard
 
@@ -328,7 +348,7 @@ final class UsageStore: ObservableObject {
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
             let faint = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-            for (i, u) in [claude, codex].enumerated() {
+            for (i, u) in [claude, codex].filter(shownInMenuBar).enumerated() {
                 if i > 0 {
                     s.append(NSAttributedString(string: " | ", attributes: [
                         .foregroundColor: NSColor.tertiaryLabelColor, .font: faint]))
@@ -345,18 +365,21 @@ final class UsageStore: ObservableObject {
 
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
-        func entry(_ resource: String, _ pct: Double?, _ sev: Double?,
+        func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
                    _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool) -> NSAttributedString {
-            let color: NSColor = sev == nil ? .secondaryLabelColor
+            // Freshly-reset limits glow green for a minute — a flash, not a state.
+            let celebrating = (celebrateUntil ?? .distantPast) > Date()
+            let color: NSColor = celebrating ? .systemGreen
+                : sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
             if let img = iconImage(resource) {
                 let att = NSTextAttachment()
                 // While the provider is working the glyph breathes between its
-                // severity ink and a faint mono ghost — a blink, not a banner.
+                // ink and a faint ghost of itself — a blink, not a banner.
                 // Swaps on the 2s activity tick, so it costs nothing at idle.
                 let dim = running && Int(Date().timeIntervalSinceReferenceDate / 2) % 2 == 1
-                let iconColor = dim ? NSColor.labelColor.withAlphaComponent(0.4) : color
+                let iconColor = dim ? color.withAlphaComponent(0.4) : color
                 att.image = CatGlyph.tintedImage(
                     img, iconColor, key: "\(resource)-\(dim ? "dim" : color.description)")
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
@@ -372,6 +395,8 @@ final class UsageStore: ObservableObject {
                 metric = "~" + Countdown.compact(to: Date().addingTimeInterval(eta!))
             case "eta" where resetAt != nil:
                 metric = Countdown.compact(to: resetAt!)
+            case "maxed" where (sev ?? 0) >= 100 && (resetAt ?? .distantPast) > Date():
+                metric = "↻ " + Countdown.compact(to: resetAt!)
             default:
                 metric = pct.map { String(format: "%.0f%%", $0) } ?? "–"
             }
@@ -384,14 +409,46 @@ final class UsageStore: ObservableObject {
                     .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize - 1, weight: .medium),
                 ]))
 
+            // Status text rides along small and brief: armed on edges only,
+            // expires in seconds, never sticks for a whole task.
+            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
+                let statusColor: NSColor
+                switch alert {
+                case "task done", "running": statusColor = .systemGreen
+                case "nearing limit": statusColor = .systemOrange
+                default: statusColor = .systemRed
+                }
+                s.append(NSAttributedString(
+                    string: " · \(alert)",
+                    attributes: [
+                        .foregroundColor: statusColor,
+                        .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize - 2, weight: .medium),
+                    ]))
+            }
             return s
         }
         let t = NSMutableAttributedString()
-        t.append(entry("claude", claude.displayLeft, claude.worstUsed,
-                       claude.displayReset, claude.displayTimeToEmpty, claudeRunning))
-        t.append(NSAttributedString(string: "   "))
-        t.append(entry("codex", codex.displayLeft, codex.worstUsed,
-                       codex.displayReset, codex.displayTimeToEmpty, codexRunning))
+        var entries: [(String, String, ProviderUsage, Bool)] = []
+        if shownInMenuBar(claude) { entries.append(("claude", "Claude", claude, claudeRunning)) }
+        if shownInMenuBar(codex) { entries.append(("codex", "Codex", codex, codexRunning)) }
+        if entries.isEmpty {
+            // Everything hidden: keep the cat so the item isn't an empty gap.
+            let att = NSTextAttachment()
+            att.image = CatGlyph.tintedImage(CatGlyph.image(size: 15), .labelColor, key: "bar-cat")
+            att.bounds = CGRect(x: 0, y: -3.4, width: 15, height: 13.8)
+            t.append(NSAttributedString(attachment: att))
+            return t
+        }
+        for (i, e) in entries.enumerated() {
+            if i > 0 {
+                t.append(NSAttributedString(string: "  ·  ", attributes: [
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                    .font: NSFont.monospacedDigitSystemFont(
+                        ofSize: NSFont.smallSystemFontSize - 1, weight: .regular)]))
+            }
+            t.append(entry(e.0, e.1, e.2.displayLeft, e.2.worstUsed,
+                           e.2.displayReset, e.2.displayTimeToEmpty, e.3))
+        }
         return t
     }
 
@@ -405,7 +462,7 @@ final class UsageStore: ObservableObject {
             let nums = [lbl(u.session), lbl(u.weekly)].compactMap { $0 }.joined(separator: " · ")
             return "\(u.name): " + (nums.isEmpty ? (u.error ?? "…") : nums)
         }
-        return [line(claude), line(codex)].joined(separator: "    ")
+        return [claude, codex].filter(shownInMenuBar).map(line).joined(separator: "    ")
     }
 }
 

@@ -9,7 +9,7 @@ extension Notification.Name {
 struct SettingsView: View {
     @ObservedObject var store: UsageStore
     @AppStorage("meowbar.position") var position = "right"     // right | middle
-    @AppStorage("meowbar.displayMode") var displayMode = "percent" // percent | countdown
+    @AppStorage("meowbar.displayMode") var displayMode = "percent" // percent | maxed | countdown | eta
     @AppStorage("meowbar.alwaysFresh") var alwaysFresh = false
     @AppStorage("meowbar.alert75") var alert75 = true
     @AppStorage("meowbar.alert90") var alert90 = true
@@ -19,6 +19,9 @@ struct SettingsView: View {
     @AppStorage("meowbar.purrSound") var purrSound = false
     @AppStorage("meowbar.sadSound") var sadSound = false
     @AppStorage("meowbar.compact") var compact = false
+    @AppStorage("meowbar.showClaude") var showClaude = true
+    @AppStorage("meowbar.showCodex") var showCodex = true
+    @AppStorage("meowbar.nudgeOnlyActive") var nudgeOnlyActive = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
     @AppStorage("meowbar.autoClock") var autoClock = true
     @AppStorage("meowbar.hotkey") var hotkey = HotKey.defaultID
@@ -38,6 +41,7 @@ struct SettingsView: View {
                 }
                 Picker("Show", selection: $displayMode) {
                     Text("% left").tag("percent")
+                    Text("% left — reset countdown when maxed").tag("maxed")
                     Text("Time until reset").tag("countdown")
                     Text("Time until empty").tag("eta")
                 }
@@ -52,6 +56,8 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                Toggle("Show Claude in the menu bar", isOn: $showClaude)
+                Toggle("Show Codex in the menu bar", isOn: $showCodex)
             }
 
             Section("Alerts") {
@@ -59,6 +65,13 @@ struct SettingsView: View {
                 Toggle("Nudge at 90% used", isOn: $alert90)
                 Toggle("Nudge at 95% used", isOn: $alert95)
                 Toggle("When a limit resets", isOn: $alertReset)
+                Toggle(isOn: $nudgeOnlyActive) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Only nudge while an agent is working")
+                        Text("Limit warnings wait until Claude, Codex or Devin is actually running — a quiet Mac means a quiet menu bar.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Toggle("Meow when a limit resets", isOn: $meowSound)
                 Toggle("Meow when a task finishes", isOn: $purrSound)
                 Toggle("Sad meow when a limit maxes", isOn: $sadSound)
@@ -151,6 +164,9 @@ struct SettingsView: View {
         .onChange(of: purrSound) { changed() }
         .onChange(of: sadSound) { changed() }
         .onChange(of: compact) { changed() }
+        .onChange(of: showClaude) { changed() }
+        .onChange(of: showCodex) { changed() }
+        .onChange(of: nudgeOnlyActive) { changed() }
         .onChange(of: autoClock) { changed() }
         .onChange(of: hotkey) { changed() }
         .onChange(of: launchAtLogin) { applyLoginItem() }

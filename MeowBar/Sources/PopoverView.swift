@@ -107,10 +107,14 @@ struct PopoverView: View {
     // What the whole popover boils down to, worst news first.
     private var statusLine: (text: String, color: Color) {
         if let u = providers.first(where: { ($0.worstUsed ?? 0) >= 100 }) {
-            return ("\(u.name) maxed", .red)
+            // The one fact you opened this for: when you can work again.
+            let reset = [u.session, u.weekly].compactMap { $0?.resetsAt }
+                .filter { $0 > Date() }.min()
+            return ("\(u.name) maxed" + (reset.map { " · back in \(Countdown.compact(to: $0))" } ?? ""), .red)
         }
         if let u = providers.first(where: { ($0.worstUsed ?? 0) >= 90 }) {
-            return ("\(u.name) near the limit", .orange)
+            let eta = u.displayTimeToEmpty
+            return ("\(u.name) near the limit" + (eta.map { " · out in ~\(Countdown.rough($0))" } ?? ""), .orange)
         }
         if let u = providers.first(where: { $0.action != nil }) {
             return ("\(u.name) needs attention", .red)
@@ -219,6 +223,20 @@ struct ProviderBlock: View {
     // History only makes sense for providers with metered windows.
     private var canExpand: Bool { usage.hasData && store != nil }
 
+    // Right-click → jump into the tool: CLIs land in Terminal, Devin opens its app.
+    private var openAction: ProviderAction? {
+        switch usage.name {
+        case "Claude": return .runInTerminal("claude")
+        case "Codex": return .runInTerminal("codex")
+        case "Devin": return .openApp("Devin")
+        default: return nil
+        }
+    }
+
+    private var openTitle: String {
+        usage.name == "Devin" ? "Open Devin" : "Open \(usage.name) in Terminal"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             // header: icon + name (› opens history) + running/stale …… plan pill
@@ -288,6 +306,15 @@ struct ProviderBlock: View {
                 }
             }
 
+            // Devin has no metered windows — give the row something to say:
+            // when the last agent turn happened, read from its session log.
+            if usage.name == "Devin", !usage.hasData, !running,
+               let at = store?.devinLastActive {
+                Text("Last active \(Countdown.ago(at))")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(supportingText(colorScheme))
+            }
+
             if expanded.wrappedValue && canExpand {
                 HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
                     .transition(.opacity.combined(with: .move(edge: .top)))
@@ -318,6 +345,10 @@ struct ProviderBlock: View {
             }
         }
         .contextMenu {
+            if let action = openAction {
+                Button(openTitle) { UsageService.perform(action) }
+                Divider()
+            }
             Button("Copy usage") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(usage.shareLine(), forType: .string)
@@ -370,6 +401,21 @@ struct HistoryStrip: View {
 
     private var unit: String { samples.contains { $0.weekly != nil } ? "weekly" : "session" }
 
+    // "last 7 days · ↑3% today · busiest 3–6 PM" — one line, quietest first.
+    private func metaLine(_ days: [Double]) -> String {
+        var parts = ["last 7 days"]
+        if days.count >= 2 {
+            let delta = (days.last ?? 0) - days[days.count - 2]
+            if abs(delta) >= 3 {
+                parts.append("\(delta > 0 ? "↑" : "↓")\(Int(abs(delta).rounded()))% today")
+            }
+        }
+        if let b = UsageHistory.busiestBlock(samples) {
+            parts.append("busiest \(UsageHistory.blockLabel(startHour: b))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
     private func dayLabel(_ i: Int, of count: Int) -> String {
         let ago = count - 1 - i
         if ago == 0 { return "Today" }
@@ -398,21 +444,11 @@ struct HistoryStrip: View {
                     }
                     .frame(height: 22, alignment: .bottom)
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text("last 7 days")
-                        if days.count >= 2 {
-                            let delta = (days.last ?? 0) - days[days.count - 2]
-                            if abs(delta) >= 3 {
-                                Text("\(delta > 0 ? "↑" : "↓")\(Int(abs(delta).rounded()))% today")
-                                    .help("Points of the \(unit) limit burned today vs. yesterday")
-                            }
-                        }
-                        if let b = UsageHistory.busiestBlock(samples) {
-                            Text("busiest \(UsageHistory.blockLabel(startHour: b))")
-                        }
-                    }
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(supportingText(colorScheme))
+                    Text(metaLine(days))
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(supportingText(colorScheme))
+                        .lineLimit(1)
+                        .help("Points of the \(unit) limit burned per day")
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Last 7 days: " + days.enumerated()
@@ -574,6 +610,8 @@ struct WindowRow: View {
     private var bottomText: String {
         guard let w else { return "" }
         if w.usedPercent == 0, w.resetsAt == nil { return resetText }
+        if w.usedPercent >= 100 { return "" }       // the reset chip says it all
+        if w.usedPercent >= 75 { return resetText } // bar color already says "high"
         return ["\(Int(w.usedPercent))% used", resetText]
             .filter { !$0.isEmpty }
             .joined(separator: " · ")

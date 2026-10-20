@@ -496,6 +496,23 @@ private final class DevinTurnTracker: @unchecked Sendable {
         return false
     }
 
+    // Newest write to any session db — powers "last active" in the popover.
+    // Unlike hasActiveTurn there's no recency gate: yesterday counts.
+    func lastActivity() -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        var latest = Date.distantPast
+        for name in names where name.hasSuffix(".db") {
+            let path = dir + "/" + name
+            let written = [path, path + "-wal"]
+                .compactMap { (try? fm.attributesOfItem(atPath: $0))?[.modificationDate] as? Date }
+                .max() ?? .distantPast
+            if written > latest { latest = written }
+        }
+        return latest == .distantPast ? nil : latest
+    }
+
     private func latestRows(_ path: String) -> [DevinActivity.Row] {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
@@ -567,7 +584,7 @@ enum UsageService {
     // flight. The CPU check matches case-sensitively so the "Devin" IDE app
     // (capital D, busy with UI) doesn't count — its agent turns come from the
     // ACP session log instead.
-    static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool) {
+    static func activeCLIs() -> (claude: Bool, codex: Bool, devin: Bool, devinLastActive: Date?) {
         // Executable names (ucomm) — a path can hide `codex`/`claude` when
         // they live inside an editor extension. Read in-process (libproc),
         // not by spawning `ps` every 2s.
@@ -597,7 +614,7 @@ enum UsageService {
         c = c || (claudeExists && claudeTurnActive)
         x = x || (codexExists && codexTurnActive)
         d = d || (devinExists && devinTurnActive)
-        return (c, x, d)
+        return (c, x, d, devinTurnTracker.lastActivity())
     }
 
     // /api/oauth/usage is aggressively rate-limited (429 + Retry-After).
@@ -1051,10 +1068,12 @@ enum Notifier {
     }
 
     // `others` lets a limit warning point at a tool that still has headroom.
-    static func evaluate(_ u: ProviderUsage, others: [ProviderUsage] = []) {
+    // `active` is any agent running — Settings can hold nudges until then.
+    static func evaluate(_ u: ProviderUsage, others: [ProviderUsage] = [], active: Bool = true) {
         let d = UserDefaults.standard
         // First launch: defaults register as true
         let on = { d.object(forKey: $0) == nil ? true : d.bool(forKey: $0) }
+        let nudgeNow = !d.bool(forKey: "meowbar.nudgeOnlyActive") || active
         for (label, w) in [("session", u.session), ("weekly", u.weekly)] {
             guard let w else { continue }
             let key = "\(u.name) \(label)"
@@ -1070,7 +1089,7 @@ enum Notifier {
             else if on("meowbar.alert90"), w.usedPercent >= 90 { level = 90 }
             else if on("meowbar.alert75"), w.usedPercent >= 75 { level = 75 }
             let prev = lastLevel[key] ?? 0
-            if level > prev {
+            if nudgeNow, level > prev {
                 var body = w.resetsAt.map { "Resets \(Self.countdown(to: $0))." } ?? ""
                 if level >= 90, let alt = others
                     .compactMap({ o in o.displayLeft.map { (o.name, $0) } })
