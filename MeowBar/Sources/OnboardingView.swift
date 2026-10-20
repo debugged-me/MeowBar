@@ -10,25 +10,45 @@ struct OnboardingView: View {
     }
 
     var onDone: (Choices) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var alwaysFresh = true
     @State private var autoClock = true
     @State private var launchAtLogin = true
+    @State private var appeared = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 12) {
-                CatView(mood: .napping, size: 30)
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle().fill(Color.accentColor.opacity(0.14))
+                    CatView(mood: .napping, size: 25, animating: false)
+                        .offset(x: 6)
+                }
+                .frame(width: 58, height: 58)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Welcome to MeowBar").font(.title2.weight(.bold))
-                    Text("Your Claude and Codex limits, always in the menu bar.")
+                    Text("Welcome to MeowBar")
+                        .font(.title2.weight(.bold))
+                    Text("Your AI limits, one glance away.")
                         .font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(LinearGradient(colors: [Color.accentColor.opacity(0.13),
+                                                  Color.accentColor.opacity(0.035)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .strokeBorder(Color.accentColor.opacity(0.18), lineWidth: 0.7)
+            }
 
             HStack(spacing: 8) {
                 MenuBarMock()
-                Text("— it lives up here")
+                Text("Lives quietly in your menu bar")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.tertiary)
             }
@@ -38,18 +58,26 @@ struct OnboardingView: View {
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
             } icon: {
-                Image(systemName: "key.fill").foregroundStyle(.secondary)
+                Image(systemName: "key.fill")
+                    .foregroundStyle(Color.accentColor)
             }
-            .padding(10)
+            .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
+            .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
+            }
 
-            VStack(alignment: .leading, spacing: 12) {
-                option($alwaysFresh, "Always-fresh Claude numbers",
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recommended setup")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                option($alwaysFresh, icon: "bolt.horizontal.fill", "Always-fresh Claude numbers",
                        "Claude Code reports its limits to MeowBar through its status line. Your current status line keeps working.")
-                option($autoClock, "Start Claude's 5h clock automatically",
+                option($autoClock, icon: "clock.arrow.circlepath", "Start Claude's 5h clock automatically",
                        "When the session is idle and you're at your Mac, MeowBar sends a one-word prompt so the window — and its reset — starts sooner.")
-                option($launchAtLogin, "Launch at login", nil)
+                option($launchAtLogin, icon: "power", "Launch at login", nil)
             }
 
             Text("Optional cat sounds — a meow on reset, a meow on task done, a sad mewl when a limit maxes — live in Settings → Alerts. Off until you want them.")
@@ -64,16 +92,32 @@ struct OnboardingView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .controlSize(.large)
+                .buttonStyle(.borderedProminent)
             }
         }
         .padding(24)
-        .frame(width: 420)
+        .frame(width: 440)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .opacity(appeared ? 1 : 0)
+        .offset(y: appeared ? 0 : 8)
+        .onAppear {
+            if reduceMotion {
+                appeared = true
+            } else {
+                withAnimation(.easeOut(duration: 0.35)) { appeared = true }
+            }
+        }
     }
 
-    private func option(_ isOn: Binding<Bool>, _ title: String, _ detail: String?) -> some View {
+    private func option(_ isOn: Binding<Bool>, icon: String, _ title: String, _ detail: String?) -> some View {
         HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 28, height: 28)
+                .background(Color.accentColor.opacity(0.10), in: .circle)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                Text(title).font(.callout.weight(.medium))
                 if let detail {
                     Text(detail).font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -84,6 +128,12 @@ struct OnboardingView: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
+        }
+        .padding(11)
+        .background(Color.primary.opacity(0.045), in: .rect(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
         }
     }
 }
