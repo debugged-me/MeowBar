@@ -301,13 +301,15 @@ struct ProviderBlock: View {
         guard running, let st = store?.taskStart[usage.name] else { return nil }
         let elapsed = Date().timeIntervalSince(st)
         guard elapsed >= 60 else { return nil }
-        return Countdown.compact(to: Date().addingTimeInterval(elapsed))
+        return liveDur(elapsed)
     }
 
-    // "now" under a minute, then compact — for the meta line's live part.
+    // "now" under a minute, "4 min" under an hour, "1h24m" beyond — a bare
+    // "4m" reads as "million" outside a countdown context.
     private func liveDur(_ secs: TimeInterval) -> String {
-        secs < 60 ? "now"
-            : Countdown.compact(to: Date().addingTimeInterval(secs))
+        if secs < 60 { return "now" }
+        if secs < 3600 { return "\(Int(secs / 60)) min" }
+        return Countdown.compact(to: Date().addingTimeInterval(secs))
     }
 
     // " · 5h" / " · 7d" — the span suffix an extra window's row title carries.
@@ -316,30 +318,25 @@ struct ProviderBlock: View {
         return s >= 86400 ? " · \(Int(s / 86400))d" : " · \(Int(s / 3600))h"
     }
 
-    // "working 12m · burned 4% · 3 tasks · 1h24m today" — nil when there's
-    // nothing to say. Burns are joined to the span by sample timestamps.
+    // "working 4 min · burned 3% · 2 tasks today" / "3 tasks · 1h24m today ·
+    // last burned 4%" — nil when there's nothing to say. Kept short: the
+    // running chip already carries the live duration, and the +N chip covers
+    // the whole day's burn, so this line stays under the 304pt popover.
     private var taskLine: String? {
         guard let store else { return nil }
         let (count, secs) = TaskStats.today(store.taskSpans, provider: usage.name)
         let samples = store.history[usage.name] ?? []
         var parts: [String] = []
-        var total = secs
         if running, let st = store.taskStart[usage.name] {
-            let elapsed = Date().timeIntervalSince(st)
-            var live = "working \(liveDur(elapsed))"
+            var live = "working \(liveDur(Date().timeIntervalSince(st)))"
             let burned = UsageHistory.burnBetween(st, Date(), in: samples)
             if burned >= 0.5 { live += " · burned \(Int(burned.rounded()))%" }
             parts.append(live)
-            total += elapsed
-        }
-        if count > 0 {
-            parts.append("\(count) task\(count == 1 ? "" : "s")")
-            if total >= 60 {
-                parts.append(Countdown.compact(to: Date().addingTimeInterval(total)))
-            }
-            parts[parts.count - 1] += " today"
-        }
-        if !running {
+            if count > 0 { parts.append("\(count) task\(count == 1 ? "" : "s") today") }
+        } else if count > 0 {
+            var seg = "\(count) task\(count == 1 ? "" : "s")"
+            if secs >= 60 { seg += " · \(liveDur(secs))" }
+            parts.append(seg + " today")
             let day = Calendar.current.startOfDay(for: Date())
             if let last = store.taskSpans.last(where: {
                     $0.provider == usage.name && $0.end > day }) {
@@ -368,7 +365,8 @@ struct ProviderBlock: View {
                         .frame(width: 22, height: 22)
                         .background(brandColor.opacity(colorScheme == .dark ? 0.17 : 0.10), in: .circle)
                 }
-                let name = Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
+                let name = Text(usage.name).font(.subheadline.weight(.bold))
+                    .foregroundStyle(.primary).lineLimit(1)
                 if canExpand {
                     Button {
                         withAnimation(reduceMotion ? nil : PopoverMotion.resize) {
@@ -404,7 +402,9 @@ struct ProviderBlock: View {
                         .foregroundStyle(supportingText(colorScheme))
                         .help("Last numbers MeowBar got — it keeps retrying")
                 }
-                if let today = UsageHistory.dailyBurn(store?.history[usage.name] ?? [], days: 1).last,
+                // Hidden while running — the running chip takes its slot, and
+                // the burn is in the dropdown anyway; keeps the plan pill uncut.
+                if !running, let today = UsageHistory.dailyBurn(store?.history[usage.name] ?? [], days: 1).last,
                    today >= 0.5 {
                     Text("+\(Int(today.rounded())) today")
                         .font(.caption2.weight(.medium))
@@ -556,9 +556,10 @@ struct HistoryStrip: View {
 
     private var unit: String { samples.contains { $0.weekly != nil } ? "weekly" : "session" }
 
-    // "last 7 days · ↑3% today · busiest 3–6 PM" — one line, quietest first.
+    // "↑3% today · busiest 3–6 PM" — right-aligned beside the 7 bars, so it
+    // can't afford "last 7 days" (the bars say it) or it ellipsizes.
     private func metaLine(_ days: [Double]) -> String {
-        var parts = ["last 7 days"]
+        var parts: [String] = []
         if days.count >= 2 {
             let delta = (days.last ?? 0) - days[days.count - 2]
             if abs(delta) >= 3 {
