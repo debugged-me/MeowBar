@@ -21,6 +21,7 @@ struct SettingsView: View {
     @AppStorage("meowbar.compact") var compact = false
     @AppStorage("meowbar.showClaude") var showClaude = true
     @AppStorage("meowbar.showCodex") var showCodex = true
+    @AppStorage("meowbar.showDevin") var showDevin = false
     @AppStorage("meowbar.nudgeOnlyActive") var nudgeOnlyActive = false
     @AppStorage("meowbar.launchAtLogin") var launchAtLogin = false
     @AppStorage("meowbar.autoClock") var autoClock = true
@@ -58,6 +59,7 @@ struct SettingsView: View {
                 }
                 Toggle("Show Claude in the menu bar", isOn: $showClaude)
                 Toggle("Show Codex in the menu bar", isOn: $showCodex)
+                Toggle("Show Devin in the menu bar", isOn: $showDevin)
             }
 
             Section("Alerts") {
@@ -166,6 +168,7 @@ struct SettingsView: View {
         .onChange(of: compact) { changed() }
         .onChange(of: showClaude) { changed() }
         .onChange(of: showCodex) { changed() }
+        .onChange(of: showDevin) { changed() }
         .onChange(of: nudgeOnlyActive) { changed() }
         .onChange(of: autoClock) { changed() }
         .onChange(of: hotkey) { changed() }

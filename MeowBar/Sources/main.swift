@@ -24,15 +24,21 @@ final class UsageStore: ObservableObject {
     @Published var popoverShown = false
     var onUpdate: (() -> Void)?
     var onAlert: (() -> Void)?
+    // Per-animation-tick refresh: title + island only, no tooltip/a11y churn.
+    var onFrame: (() -> Void)?
     private var timer: Timer?
     private var activityTimer: Timer?
     private var updateTimer: Timer?
     private var lastClockAttempt: Date?
     private var activityCheckInFlight = false
     // Transient menu-bar alerts: armed on state edges (task finished, limit
-    // reached), auto-clear after alertTTL or instantly on click.
+    // reached), auto-clear after alertTTL or instantly on click. armedAt feeds
+    // the typewriter reveal — each letter lands on its own tick.
     private var alertText: [String: String] = [:]
     private var alertUntil: [String: Date] = [:]
+    private var alertArmedAt: [String: Date] = [:]
+    private var motionTimer: Timer?
+    private var wakeTimer: Timer?
     // A CPU spike is not a task. Rapid samples let IDE-hosted agents appear as
     // running promptly, while confirmation in both directions filters helper
     // startup and prevents false "task done" messages.
@@ -258,6 +264,8 @@ final class UsageStore: ObservableObject {
                         // and fades on its own — no fade-pulse, it's not an alert.
                         self.alertText[sample.0] = "running"
                         self.alertUntil[sample.0] = now.addingTimeInterval(self.alertTTL)
+                        self.alertArmedAt[sample.0] = now
+                        self.kickStatusAnimation()
                     }
                 }
                 if let last = activity.devinLastActive, last != self.devinLastActive {
@@ -299,13 +307,74 @@ final class UsageStore: ObservableObject {
     private func arm(_ name: String, _ text: String, now: Date) {
         alertText[name] = text
         alertUntil[name] = now.addingTimeInterval(alertTTL)
+        alertArmedAt[name] = now
+        kickStatusAnimation()
         onAlert?()
+    }
+
+    // Status letters ride a two-wave curve: each fades in while rising ~1.5pt
+    // on an ease-out settle, holds fully formed, then sinks out left-to-right.
+    // A 60fps timer exists only while a letter is actually mid-flight; during
+    // the static hold a one-shot wake resumes motion exactly at the outro.
+    private static let letterStagger: TimeInterval = 0.024
+    private static let letterFade: TimeInterval = 0.26
+    private static let outroStagger: TimeInterval = 0.018
+    private static let outroFade: TimeInterval = 0.2
+    private static let letterRise: CGFloat = 1.6
+    private static let letterSink: CGFloat = 0.9
+    private static let statusFont = NSFont.systemFont(
+        ofSize: NSFont.smallSystemFontSize - 2, weight: .medium)
+
+    private static func clamp01(_ x: TimeInterval) -> Double { min(1, max(0, x)) }
+
+    // Any live status mid-flight? If not but one is holding, when does the
+    // earliest outro begin — the wake that resumes the 60fps timer.
+    private func statusMotion(now: Date) -> (moving: Bool, wake: Date?) {
+        var moving = false
+        var wake: Date?
+        for (name, text) in alertText {
+            guard let until = alertUntil[name], until > now,
+                  let armed = alertArmedAt[name] else { continue }
+            let n = Double(max(0, text.count - 1))
+            let introEnd = armed.addingTimeInterval(
+                Self.letterStagger * n + Self.letterFade)
+            let outroStart = until.addingTimeInterval(
+                -(Self.outroStagger * n + Self.outroFade))
+            if now < introEnd || now >= outroStart { moving = true }
+            else if wake == nil || outroStart < wake! { wake = outroStart }
+        }
+        return (moving, wake)
+    }
+
+    private func kickStatusAnimation() {
+        wakeTimer?.invalidate()
+        wakeTimer = nil
+        guard motionTimer == nil else { return }
+        motionTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.onFrame?()
+            let (moving, wake) = self.statusMotion(now: Date())
+            if !moving {
+                self.motionTimer?.invalidate()
+                self.motionTimer = nil
+                if let wake {
+                    self.wakeTimer = Timer.scheduledTimer(
+                        withTimeInterval: max(0.01, wake.timeIntervalSinceNow),
+                        repeats: false) { [weak self] _ in self?.kickStatusAnimation() }
+                }
+            }
+        }
     }
 
     // Click = "seen it": clear all live alerts immediately.
     func acknowledgeAlerts() {
         alertText.removeAll()
         alertUntil.removeAll()
+        alertArmedAt.removeAll()
+        motionTimer?.invalidate()
+        motionTimer = nil
+        wakeTimer?.invalidate()
+        wakeTimer = nil
         onUpdate?()
     }
 
@@ -322,11 +391,14 @@ final class UsageStore: ObservableObject {
     }
 
 
-    // Per-provider visibility toggles (Settings → Menu bar), default on.
+    // Per-provider visibility toggles (Settings → Menu bar). Claude & Codex
+    // default on; Devin is opt-in and only qualifies when it's actually set up.
     private func shownInMenuBar(_ u: ProviderUsage) -> Bool {
-        let key = u.name == "Claude" ? "meowbar.showClaude" : "meowbar.showCodex"
+        if u.name == "Devin" && !u.isVisible { return false }
+        let key = "meowbar.show" + u.name
         let ud = UserDefaults.standard
-        return ud.object(forKey: key) == nil || ud.bool(forKey: key)
+        return u.name == "Devin" ? ud.bool(forKey: key)
+            : (ud.object(forKey: key) == nil || ud.bool(forKey: key))
     }
 
     var menuTitle: NSAttributedString {
@@ -348,7 +420,7 @@ final class UsageStore: ObservableObject {
             s.append(NSAttributedString(string: "  "))
             let small = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
             let faint = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-            for (i, u) in [claude, codex].filter(shownInMenuBar).enumerated() {
+            for (i, u) in [claude, codex, devin].filter(shownInMenuBar).enumerated() {
                 if i > 0 {
                     s.append(NSAttributedString(string: " | ", attributes: [
                         .foregroundColor: NSColor.tertiaryLabelColor, .font: faint]))
@@ -357,7 +429,8 @@ final class UsageStore: ObservableObject {
                 let c: NSColor = sev == nil ? .secondaryLabelColor
                     : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
                 s.append(NSAttributedString(
-                    string: u.displayLeft.map { String(format: "%.0f%%", $0) } ?? "–",
+                    string: u.displayLeft.map { String(format: "%.0f%%", $0) }
+                        ?? (u.noteAccent == "unlimited" ? "∞" : "–"),
                     attributes: [.foregroundColor: c, .font: small]))
             }
             return s
@@ -366,7 +439,7 @@ final class UsageStore: ObservableObject {
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
         func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
-                   _ resetAt: Date?, _ eta: TimeInterval?, _ running: Bool) -> NSAttributedString {
+                   _ resetAt: Date?, _ eta: TimeInterval?) -> NSAttributedString {
             // Freshly-reset limits glow green for a minute — a flash, not a state.
             let celebrating = (celebrateUntil ?? .distantPast) > Date()
             let color: NSColor = celebrating ? .systemGreen
@@ -375,13 +448,9 @@ final class UsageStore: ObservableObject {
             let s = NSMutableAttributedString()
             if let img = iconImage(resource) {
                 let att = NSTextAttachment()
-                // While the provider is working the glyph breathes between its
-                // ink and a faint ghost of itself — a blink, not a banner.
-                // Swaps on the 2s activity tick, so it costs nothing at idle.
-                let dim = running && Int(Date().timeIntervalSinceReferenceDate / 2) % 2 == 1
-                let iconColor = dim ? color.withAlphaComponent(0.4) : color
+                // Single-ink glyph in the severity color — still, like Drive's.
                 att.image = CatGlyph.tintedImage(
-                    img, iconColor, key: "\(resource)-\(dim ? "dim" : color.description)")
+                    img, color, key: "\(resource)-\(color.description)")
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }
@@ -398,7 +467,9 @@ final class UsageStore: ObservableObject {
             case "maxed" where (sev ?? 0) >= 100 && (resetAt ?? .distantPast) > Date():
                 metric = "↻ " + Countdown.compact(to: resetAt!)
             default:
-                metric = pct.map { String(format: "%.0f%%", $0) } ?? "–"
+                // Unlimited plans carry no windows — a ∞ reads truer than "–".
+                metric = pct.map { String(format: "%.0f%%", $0) }
+                    ?? (resource == "devin" && devin.noteAccent == "unlimited" ? "∞" : "–")
             }
             s.append(NSAttributedString(
                 string: " " + metric,
@@ -410,27 +481,51 @@ final class UsageStore: ObservableObject {
                 ]))
 
             // Status text rides along small and brief: armed on edges only,
-            // expires in seconds, never sticks for a whole task.
-            if let alert = alertText[name], (alertUntil[name] ?? .distantPast) > Date() {
+            // letters rise in on an ease-out wave, hold, then sink away —
+            // gone in seconds, never sticks for a task.
+            if let alert = alertText[name],
+               let until = alertUntil[name], until > Date() {
                 let statusColor: NSColor
                 switch alert {
                 case "task done", "running": statusColor = .systemGreen
                 case "nearing limit": statusColor = .systemOrange
                 default: statusColor = .systemRed
                 }
-                s.append(NSAttributedString(
-                    string: " · \(alert)",
-                    attributes: [
-                        .foregroundColor: statusColor,
-                        .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize - 2, weight: .medium),
-                    ]))
+                let now = Date()
+                let armed = alertArmedAt[name] ?? now
+                let n = max(0, alert.count - 1)
+                let outroStart = until.addingTimeInterval(
+                    -(Self.outroStagger * Double(n) + Self.outroFade))
+                // Each letter: p = rise-in progress (ease-out), q = sink-out
+                // progress (ease-in). alpha = p·(1−q), baseline drifts from
+                // −rise up to 0, then eases down −sink as it leaves.
+                func letterFrame(_ i: Int) -> (alpha: Double, baseline: CGFloat) {
+                    let p = Self.clamp01((now.timeIntervalSince(armed)
+                        - Double(i) * Self.letterStagger) / Self.letterFade)
+                    let q = Self.clamp01((now.timeIntervalSince(outroStart)
+                        - Double(i) * Self.outroStagger) / Self.outroFade)
+                    return ((1 - (1 - p) * (1 - p) * (1 - p)) * (1 - q * q),
+                            (1 - p * (2 - p)) * -Self.letterRise - q * q * Self.letterSink)
+                }
+                let head = letterFrame(0)
+                s.append(NSAttributedString(string: " · ", attributes: [
+                    .foregroundColor: statusColor.withAlphaComponent(head.alpha),
+                    .font: Self.statusFont]))
+                for (i, ch) in alert.enumerated() {
+                    let f = letterFrame(i)
+                    s.append(NSAttributedString(string: String(ch), attributes: [
+                        .foregroundColor: statusColor.withAlphaComponent(f.alpha),
+                        .baselineOffset: f.baseline,
+                        .font: Self.statusFont]))
+                }
             }
             return s
         }
         let t = NSMutableAttributedString()
-        var entries: [(String, String, ProviderUsage, Bool)] = []
-        if shownInMenuBar(claude) { entries.append(("claude", "Claude", claude, claudeRunning)) }
-        if shownInMenuBar(codex) { entries.append(("codex", "Codex", codex, codexRunning)) }
+        var entries: [(String, String, ProviderUsage)] = []
+        if shownInMenuBar(claude) { entries.append(("claude", "Claude", claude)) }
+        if shownInMenuBar(codex) { entries.append(("codex", "Codex", codex)) }
+        if shownInMenuBar(devin) { entries.append(("devin", "Devin", devin)) }
         if entries.isEmpty {
             // Everything hidden: keep the cat so the item isn't an empty gap.
             let att = NSTextAttachment()
@@ -447,7 +542,7 @@ final class UsageStore: ObservableObject {
                         ofSize: NSFont.smallSystemFontSize - 1, weight: .regular)]))
             }
             t.append(entry(e.0, e.1, e.2.displayLeft, e.2.worstUsed,
-                           e.2.displayReset, e.2.displayTimeToEmpty, e.3))
+                           e.2.displayReset, e.2.displayTimeToEmpty))
         }
         return t
     }
@@ -460,9 +555,11 @@ final class UsageStore: ObservableObject {
                 return String(format: "%@ %.0f%% left", span, 100 - w.usedPercent)
             }
             let nums = [lbl(u.session), lbl(u.weekly)].compactMap { $0 }.joined(separator: " · ")
-            return "\(u.name): " + (nums.isEmpty ? (u.error ?? "…") : nums)
+            // No metered windows (Devin unlimited, errors) → reuse shareLine's
+            // fallbacks ("Pro unlimited", the error) instead of "…".
+            return nums.isEmpty ? u.shareLine() : "\(u.name): " + nums
         }
-        return [claude, codex].filter(shownInMenuBar).map(line).joined(separator: "    ")
+        return [claude, codex, devin].filter(shownInMenuBar).map(line).joined(separator: "    ")
     }
 }
 
@@ -533,10 +630,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         store.onUpdate = { [weak self] in
             guard let self else { return }
-            self.statusItem.button?.attributedTitle = self.store.menuTitle
+            let title = self.store.menuTitle
+            self.statusItem.button?.attributedTitle = title
             self.statusItem.button?.toolTip = self.store.menuToolTip
             self.statusItem.button?.setAccessibilityLabel("MeowBar. " + self.store.menuToolTip)
-            self.layoutIsland()
+            self.layoutIsland(title: title)
+        }
+        // Animation ticks: rebuild the title but skip tooltip/a11y — those
+        // only change on real state updates, not mid-frame.
+        store.onFrame = { [weak self] in
+            guard let self else { return }
+            let title = self.store.menuTitle
+            self.statusItem.button?.attributedTitle = title
+            self.layoutIsland(title: title)
         }
         store.onAlert = { [weak self] in self?.flashMenuItem() }
         // First run explains the Keychain prompt before anything triggers it.
@@ -784,11 +890,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layoutIsland()
     }
 
-    private func layoutIsland() {
+    private func layoutIsland(title prebuilt: NSAttributedString? = nil) {
         guard let p = islandPanel, let tf = islandField,
               let screen = NSScreen.main, p.isVisible else { return }
         let bg = p.contentView as? IslandView
-        let title = store.menuTitle
+        let title = prebuilt ?? store.menuTitle
         tf.attributedStringValue = title
         tf.sizeToFit() // attributed .size() under-measures image attachments
         let sz = tf.fittingSize
