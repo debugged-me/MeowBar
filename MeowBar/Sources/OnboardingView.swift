@@ -112,8 +112,10 @@ private struct MenuBarMock: View {
         HStack(spacing: 3) {
             if let img = Bundle.main.image(forResource: icon) {
                 Image(nsImage: img)
+                    .renderingMode(.template)
                     .resizable().aspectRatio(contentMode: .fit)
                     .frame(width: 11, height: 11)
+                    .foregroundStyle(.secondary)
             }
             Text(text)
                 .font(.system(size: 10, weight: .medium))

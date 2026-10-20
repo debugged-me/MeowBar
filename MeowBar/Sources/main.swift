@@ -353,7 +353,10 @@ final class UsageStore: ObservableObject {
             let s = NSMutableAttributedString()
             if let img = iconImage(resource) {
                 let att = NSTextAttachment()
-                att.image = img
+                // Single-ink glyph, tinted like the metric it introduces —
+                // menu-bar icons read monochrome (Drive-style), not brand art.
+                att.image = CatGlyph.tintedImage(
+                    img, color, key: "\(resource)-\(color.description)")
                 att.bounds = CGRect(x: 0, y: -3, width: 16, height: 16)
                 s.append(NSAttributedString(attachment: att))
             }

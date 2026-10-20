@@ -224,8 +224,10 @@ struct ProviderBlock: View {
             // header: icon + name (› opens history) + running/stale …… plan pill
             HStack(spacing: 6) {
                 if let icon = providerIcon {
-                    Image(nsImage: icon).resizable().aspectRatio(contentMode: .fit)
+                    Image(nsImage: icon).renderingMode(.template)
+                        .resizable().aspectRatio(contentMode: .fit)
                         .frame(width: 13, height: 13)
+                        .foregroundStyle(.primary)
                 }
                 let name = Text(usage.name).font(.subheadline.weight(.bold)).foregroundStyle(.primary)
                 if canExpand {
