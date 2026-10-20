@@ -8,6 +8,7 @@ extension Notification.Name {
 
 struct SettingsView: View {
     @ObservedObject var store: UsageStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("meowbar.position") var position = "right"     // right | middle
     @AppStorage("meowbar.displayMode") var displayMode = "percent" // percent | maxed | countdown | eta
     @AppStorage("meowbar.alwaysFresh") var alwaysFresh = false
@@ -31,11 +32,14 @@ struct SettingsView: View {
     @State private var checkingUpdate = false
 
     var body: some View {
-        // ScrollView + cap: the form grew past smaller screens' height —
-        // it scrolls instead of clipping the bottom off-screen.
-        ScrollView {
+        VStack(spacing: 0) {
+            settingsHeader
+                .zIndex(1)
+            Divider()
+            // Form owns the scrolling. Nesting it in another ScrollView makes
+            // AppKit restore an arbitrary inner offset when the window opens.
             Form {
-            Section("Menu bar") {
+            Section {
                 Picker("Position", selection: $position) {
                     Text("Right — with the other icons").tag("right")
                     Text("Middle — like the notch").tag("middle")
@@ -49,6 +53,7 @@ struct SettingsView: View {
                 if displayMode == "eta" {
                     Text("Shows how long until the limit runs out at your current pace — ~2h means you'd hit it in about 2 hours. When you're not on pace to run out, it falls back to the reset countdown.")
                         .font(.caption).foregroundStyle(.secondary)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
                 Toggle(isOn: $compact) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -60,9 +65,11 @@ struct SettingsView: View {
                 Toggle("Show Claude in the menu bar", isOn: $showClaude)
                 Toggle("Show Codex in the menu bar", isOn: $showCodex)
                 Toggle("Show Devin in the menu bar", isOn: $showDevin)
+            } header: {
+                sectionHeader("Menu bar", systemImage: "menubar.rectangle")
             }
 
-            Section("Alerts") {
+            Section {
                 Toggle("Nudge at 75% used", isOn: $alert75)
                 Toggle("Nudge at 90% used", isOn: $alert90)
                 Toggle("Nudge at 95% used", isOn: $alert95)
@@ -77,9 +84,11 @@ struct SettingsView: View {
                 Toggle("Meow when a limit resets", isOn: $meowSound)
                 Toggle("Meow when a task finishes", isOn: $purrSound)
                 Toggle("Sad meow when a limit maxes", isOn: $sadSound)
+            } header: {
+                sectionHeader("Alerts", systemImage: "bell.badge")
             }
 
-            Section("Claude") {
+            Section {
                 Toggle(isOn: $alwaysFresh) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Always fresh")
@@ -92,6 +101,7 @@ struct SettingsView: View {
                          ? "Tracking on — numbers arrive after your next Claude Code message."
                          : (bridgeError ?? "Installing…"))
                         .font(.caption).foregroundStyle(.secondary)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
                 Toggle(isOn: $autoClock) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -100,17 +110,21 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+            } header: {
+                sectionHeader("Claude", systemImage: "bolt.horizontal.circle")
             }
 
-            Section("App") {
+            Section {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                 Picker("Open MeowBar with", selection: $hotkey) {
                     Text("Off").tag("off")
                     ForEach(HotKey.choices, id: \.id) { Text($0.combo.label).tag($0.id) }
                 }
+            } header: {
+                sectionHeader("App", systemImage: "slider.horizontal.3")
             }
 
-            Section("About") {
+            Section {
                 HStack {
                     Text("Version")
                     Spacer()
@@ -144,13 +158,20 @@ struct SettingsView: View {
                         }
                     }
                 }
+            } header: {
+                sectionHeader("About", systemImage: "info.circle")
             }
-        }
+            }
             .formStyle(.grouped)
-            .padding(4)
+            .padding(.horizontal, 6)
+            .padding(.bottom, 10)
+            .scrollContentBackground(.hidden)
+            .clipped()
         }
-        .scrollContentBackground(.hidden)
-        .frame(width: 420, height: 620)
+        .background(.background)
+        .frame(width: 440, height: 650)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.24), value: displayMode)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.24), value: alwaysFresh)
         .onAppear {
             bridgeInstalled = StatuslineBridge.isInstalled
             alwaysFresh = bridgeInstalled // reflect real state, even if enabled elsewhere
@@ -184,6 +205,41 @@ struct SettingsView: View {
             }
             changed()
         }
+    }
+
+    private var settingsHeader: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(Color.accentColor.opacity(0.13))
+                CatView(mood: .napping, size: 17, animating: false)
+                    .offset(x: 4)
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("MeowBar Settings")
+                    .font(.title3.weight(.semibold))
+                Text("Make the menu bar useful without making it noisy.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("v\(UpdateCheck.currentVersion)")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary, in: .capsule)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    private func sectionHeader(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .textCase(nil)
     }
 
     private func changed() {

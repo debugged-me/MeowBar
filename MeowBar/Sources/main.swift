@@ -594,14 +594,9 @@ enum CatSound {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
-    // Clicking the status item while the popover is open can auto-dismiss it
-    // AND fire the action — without this guard the click reopens instead of
-    // closing. 0.4s is below human double-tap speed for a deliberate reopen.
-    private var popoverClosedAt = Date.distantPast
-    // The close animation runs ~0.5s with isShown still true. If an outside
-    // click started it and you then click the bar, that click means "open".
+    // True from the start of a close until popoverDidClose. AppKit's close
+    // transaction outlasts the visible zoom-out by ~0.4s (see togglePopover).
     private var popoverClosing = false
-    private var closedByOutsideClick = false
     private var reopenAfterClose = false
     // The view the popover's arrow points at: the status button, or the
     // island capsule in "middle" mode.
@@ -622,10 +617,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
-        popover.behavior = .semitransient
+        // Dismissal is managed explicitly below (outside clicks, keys,
+        // sleep/lock, display changes).
+        popover.behavior = .applicationDefined
+        // AppKit's own animation zooms the whole surface — glass, arrow and
+        // shadow — out of the menu-bar item and back into it. Don't replace
+        // it with a snapshot morph: the glass is composited by the window
+        // server, so a snapshot holds only bare text floating on the desktop.
+        popover.animates = true
         popover.delegate = self
-        let host = NSHostingController(rootView: PopoverView(store: store))
-        host.sizingOptions = .preferredContentSize
+        let host = NSHostingController(rootView: PopoverView(store: store) { [weak self] size in
+            self?.fitPopover(to: size)
+        })
+        // Sized by fitPopover, not .preferredContentSize: AppKit applies that
+        // in one frame while SwiftUI animates the layout over 0.25s, so the
+        // glass edge jumped and the content was clipped mid-expand.
+        host.sizingOptions = []
         popover.contentViewController = host
 
         store.onUpdate = { [weak self] in
@@ -669,6 +676,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["MEOWBAR_SETTINGS_SHOT"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.openSettings() }
         }
+        // Motion QA: open, close, then reopen through the real status-item
+        // anchor so a short screen recording can inspect every keyframe.
+        if ProcessInfo.processInfo.environment["MEOWBAR_MOTION_DEMO"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.togglePopover() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.closePopover() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.7) { self.togglePopover() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.7) { self.closePopover() }
+        }
         NotificationCenter.default.addObserver(forName: .meowbarSettingsChanged,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.applyPosition()
@@ -678,7 +693,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(forName: .init("meowbar.openSettings"),
                                                object: nil, queue: .main) { [weak self] _ in
-            self?.openSettings()
+            guard let self else { return }
+            self.closePopover()
+            self.openSettings()
         }
         NotificationCenter.default.addObserver(forName: .init("meowbar.checkUpdates"),
                                                object: nil, queue: .main) { [weak self] _ in
@@ -686,7 +703,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(forName: .init("meowbar.openAbout"),
                                                object: nil, queue: .main) { [weak self] _ in
-            self?.openAbout()
+            guard let self else { return }
+            self.closePopover()
+            self.openAbout()
         }
 
         // .transient is unreliable for accessory apps — explicitly close on
@@ -701,9 +720,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             if self.clearOrphanedPopover() { return }
-            guard self.popover.isShown else { return }
-            if !self.popoverClosing { self.closedByOutsideClick = true }
-            self.popover.performClose(nil)
+            self.closePopover()
+        }
+        // Global monitors don't see clicks delivered to our own Settings or
+        // About windows. With application-defined popover behavior, close on
+        // those local clicks too while leaving the popover and its menus alone.
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, self.popover.isShown else { return event }
+            if event.window === self.popoverWindow
+                || event.window === self.statusItem.button?.window
+                || event.window === self.islandPanel
+                || event.window?.level == .popUpMenu {
+                return event
+            }
+            self.closePopover()
+            return event
         }
         // A popover left open across sleep, screen lock or a display change
         // can lose its anchor: AppKit then reports it closed while its window
@@ -741,7 +772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.terminate(nil)
                     return nil
                 case ",":
-                    self.popover.performClose(nil)
+                    self.closePopover()
                     self.openSettings()
                     return nil
                 case "1", "2", "3":
@@ -751,7 +782,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     break
                 }
             }
-            self.popover.performClose(nil)
+            self.closePopover()
             return nil
         }
 
@@ -823,6 +854,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let w = NSWindow(contentViewController: host)
             w.title = "MeowBar Settings"
             w.styleMask = [.titled, .closable]
+            w.titleVisibility = .hidden
             w.isReleasedWhenClosed = false
             w.level = .floating
             settingsWindow = w
@@ -926,7 +958,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Immediate close (no animation) for sleep, lock and display changes.
     private func dismissPopover() {
         reopenAfterClose = false
-        if popover.isShown { popover.close() }
+        if popover.isShown { closePopover(animated: false) }
         clearOrphanedPopover()
         store.popoverShown = false
     }
@@ -982,22 +1014,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePopover() {
         if clearOrphanedPopover() { return }
         if popover.isShown {
-            // Clicked away, then straight back on the bar mid-fade: reopen
-            // once the close lands instead of swallowing the click.
-            if popoverClosing && closedByOutsideClick {
+            if popoverClosing {
+                // The zoom-out is over in ~0.1s, but AppKit keeps isShown
+                // true until didClose ~0.5s later and won't show before then.
+                // A click in that gap means "open": do it once the close lands.
                 reopenAfterClose = true
-                return
+            } else {
+                closePopover()
             }
-            popover.performClose(nil)
             return
         }
-        if Date().timeIntervalSince(popoverClosedAt) < 0.4 { return }
         store.acknowledgeAlerts()
         store.refresh()
         if let bg = islandPanel?.contentView, islandPanel?.isVisible == true {
             popoverAnchor = bg
         } else {
             popoverAnchor = statusItem.button
+        }
+        // Open at the right size: while closed, nothing re-measures the view.
+        if let host = popover.contentViewController as? NSHostingController<PopoverView> {
+            fitPopover(to: host.sizeThatFits(in: NSSize(width: 0, height: 0)))
         }
         if let anchor = popoverAnchor {
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
@@ -1010,6 +1046,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Cost: a keystroke typed while the popover is open goes to us —
         // the local monitor below dismisses the popover on it.
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // Animated: AppKit zooms the popover back into its anchor, isShown
+    // staying true until popoverDidClose. Unanimated: gone this instant,
+    // for sleep, lock and display changes.
+    private func closePopover(animated: Bool = true) {
+        guard popover.isShown else { return }
+        if animated {
+            guard !popoverClosing else { return }
+            popoverClosing = true
+            popover.performClose(nil)
+        } else {
+            popover.animates = false
+            popover.close()
+            popover.animates = true
+        }
+    }
+
+    // While open, glide to a new size on the curve SwiftUI animates the
+    // layout with (PopoverMotion), so the glass edge and content move as one.
+    private func fitPopover(to size: NSSize) {
+        guard size.width > 0, size.height > 0, size != popover.contentSize else { return }
+        guard popover.isShown, !popoverClosing,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            popover.contentSize = size
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = PopoverMotion.duration
+            context.timingFunction = PopoverMotion.timingFunction
+            context.allowsImplicitAnimation = true
+            popover.contentSize = size
+        }
     }
 
     // Triple fade-pulse on the status item (and island) so a new alert —
@@ -1127,12 +1196,9 @@ extension AppDelegate: NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         store.popoverShown = false
-        popoverClosedAt = Date()
         popoverClosing = false
-        closedByOutsideClick = false
         if reopenAfterClose {
             reopenAfterClose = false
-            popoverClosedAt = .distantPast
             togglePopover()
         }
     }
