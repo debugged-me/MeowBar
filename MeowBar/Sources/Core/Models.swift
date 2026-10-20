@@ -24,10 +24,18 @@ enum ProviderAction: Equatable {
     }
 }
 
+// A named extra window — Claude's per-model weekly caps (seven_day_sonnet,
+// seven_day_opus, …) ride alongside the main session/weekly pair.
+struct NamedWindow: Codable, Equatable {
+    var label: String
+    var window: UsageWindow
+}
+
 struct ProviderUsage: Codable {
     var name: String
     var session: UsageWindow? = nil
     var weekly: UsageWindow? = nil
+    var extras: [NamedWindow]? = nil
     var error: String? = nil
     var action: ProviderAction? = nil
     var note: String? = nil       // plan label, e.g. "Pro" — shown alongside bars
@@ -36,37 +44,46 @@ struct ProviderUsage: Codable {
     // Showing a fallback copy (rate-limited, transient failure, or last run's
     // cache) rather than a fresh answer.
     var isStale = false
-    var hasData: Bool { session != nil || weekly != nil }
+    var hasData: Bool { session != nil || weekly != nil || !(extras ?? []).isEmpty }
     var isVisible: Bool { hasData || note != nil || noteAccent != nil }
 
     // Persist the numbers only — errors, actions and staleness are per-fetch.
     private enum CodingKeys: String, CodingKey {
-        case name, session, weekly, note, noteAccent, fetchedAt
+        case name, session, weekly, extras, note, noteAccent, fetchedAt
     }
 }
 
 extension ProviderUsage {
-    var worstUsed: Double? {
-        [session, weekly].compactMap { $0 }.map(\.usedPercent).max()
+    var allWindows: [UsageWindow] {
+        [session, weekly].compactMap { $0 } + (extras ?? []).map(\.window)
     }
 
-    // Menu-bar number: weekly % left only when the weekly itself is the blocker
-    // (≥90% used); otherwise the session % left.
+    var worstUsed: Double? {
+        allWindows.map(\.usedPercent).max()
+    }
+
+    // The window pinning you down: the worst one at ≥90%. A maxed Sonnet cap
+    // blocks you just as hard as a maxed session.
+    private var blocker: UsageWindow? {
+        allWindows.filter { $0.usedPercent >= 90 }.max { $0.usedPercent < $1.usedPercent }
+    }
+
+    // Menu-bar number: the blocker's % left when something is ≥90% used;
+    // otherwise the session % left.
     var displayLeft: Double? {
-        let s = session?.usedPercent, w = weekly?.usedPercent
-        if let w, w >= 90 { return 100 - w }
-        return (s ?? w).map { 100 - $0 }
+        if let b = blocker { return 100 - b.usedPercent }
+        return (session ?? weekly).map { 100 - $0.usedPercent }
     }
 
     // The window the bar is displaying — same rule as displayLeft.
     var displayReset: Date? {
-        if let w = weekly, w.usedPercent >= 90 { return w.resetsAt }
+        if let b = blocker { return b.resetsAt }
         return session?.resetsAt ?? weekly?.resetsAt
     }
 
     // Same window selection, for the "time to empty" display mode.
     var displayTimeToEmpty: TimeInterval? {
-        if let w = weekly, w.usedPercent >= 90 { return w.timeToEmpty() }
+        if let b = blocker { return b.timeToEmpty() }
         return (session ?? weekly)?.timeToEmpty()
     }
 
@@ -79,6 +96,9 @@ extension ProviderUsage {
         }
         if let w = weekly {
             parts.append("weekly \(Int(max(0, 100 - w.usedPercent)))% left")
+        }
+        for e in extras ?? [] {
+            parts.append("\(e.label.lowercased()) \(Int(max(0, 100 - e.window.usedPercent)))% left")
         }
         if parts.isEmpty {
             if let noteAccent { return "\(name): \([note, noteAccent].compactMap { $0 }.joined(separator: " "))" }
@@ -108,6 +128,9 @@ extension ProviderUsage {
         var u = self
         u.session = session?.normalized(now: now)
         u.weekly = weekly?.normalized(now: now)
+        u.extras = extras?.map {
+            NamedWindow(label: $0.label, window: $0.window.normalized(now: now))
+        }
         return u
     }
 }
@@ -183,6 +206,33 @@ extension UsageWindow {
 
     func paceVerdict(now: Date = Date()) -> String { pace(now: now).verdict }
     func paceSeverity(now: Date = Date()) -> PaceSeverity { pace(now: now).severity }
+}
+
+// Extra windows keyed like "seven_day_sonnet" / "five_hour_extra" in the
+// usage payloads — the base pair (five_hour, seven_day) is handled elsewhere.
+enum ExtraWindows {
+    static func label(forKey key: String) -> String? {
+        guard let suffix = suffix(forKey: key) else { return nil }
+        if suffix == "oauth_apps" { return "OAuth apps" }
+        return suffix.split(separator: "_")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    static func windowSeconds(forKey key: String) -> TimeInterval? {
+        if key.hasPrefix("five_hour_") { return 18000 }
+        if key.hasPrefix("seven_day_") { return 604800 }
+        return nil
+    }
+
+    // The part after the duration prefix, or nil for base/other keys.
+    private static func suffix(forKey key: String) -> String? {
+        for p in ["five_hour_", "seven_day_"] where key.hasPrefix(p) {
+            let s = String(key.dropFirst(p.count))
+            return s.isEmpty ? nil : s
+        }
+        return nil
+    }
 }
 
 enum Countdown {

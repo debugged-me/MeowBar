@@ -740,6 +740,7 @@ enum UsageService {
                 }
                 u.session = claudeWindow(json, keys: ["five_hour", "fiveHour", "session", "session_5h"], seconds: 18000)
                 u.weekly = claudeWindow(json, keys: ["seven_day", "sevenDay", "weekly", "week"], seconds: 604800)
+                u.extras = claudeExtras(json)
                 claudeCache = u
                 break
             }
@@ -996,6 +997,18 @@ enum UsageService {
         var u = ProviderUsage(name: "Claude")
         u.session = snapshotWindow(windows["five_hour"], seconds: 18000)
         u.weekly = snapshotWindow(windows["seven_day"], seconds: 604800)
+        // The helper stores every rate_limits key verbatim — per-model caps
+        // (seven_day_sonnet & co.) land here without another round trip.
+        var extras: [NamedWindow] = []
+        for (key, val) in windows {
+            guard let label = ExtraWindows.label(forKey: key),
+                  let w = snapshotWindow(val,
+                      seconds: ExtraWindows.windowSeconds(forKey: key) ?? 604800),
+                  w.resetsAt != nil || w.usedPercent > 0
+            else { continue }
+            extras.append(NamedWindow(label: label, window: w))
+        }
+        u.extras = extras.isEmpty ? nil : extras.sorted { $0.label < $1.label }
         guard u.hasData else { return nil }
         if let ts = snap["observed_at"] as? Double {
             u.fetchedAt = Date(timeIntervalSince1970: ts)
@@ -1025,6 +1038,23 @@ enum UsageService {
             win.resetsAt = Date(timeIntervalSince1970: ts > 1e12 ? ts / 1000 : ts)
         }
         return win
+    }
+
+    // Per-model and ancillary windows (seven_day_sonnet, seven_day_opus,
+    // seven_day_oauth_apps, …): the API returns them next to the base pair.
+    // Label and span come from the key suffix. A dict with neither a percent
+    // nor a reset (e.g. seven_day_breakdown's sub-structure) is skipped.
+    private static func claudeExtras(_ json: [String: Any]) -> [NamedWindow]? {
+        var out: [NamedWindow] = []
+        for (key, val) in json {
+            guard let label = ExtraWindows.label(forKey: key),
+                  let w = claudeWindow([key: val], keys: [key],
+                      seconds: ExtraWindows.windowSeconds(forKey: key) ?? 604800),
+                  w.resetsAt != nil || w.usedPercent > 0
+            else { continue }
+            out.append(NamedWindow(label: label, window: w))
+        }
+        return out.isEmpty ? nil : out.sorted { $0.label < $1.label }
     }
 
     private static func claudeWindow(_ json: [String: Any], keys: [String], seconds: TimeInterval) -> UsageWindow? {
@@ -1062,6 +1092,10 @@ enum UsageService {
 enum Notifier {
     private static var lastLevel: [String: Int] = [:]
     private static var lastReset: [String: Date] = [:]
+    // Reset instants a ~15m heads-up already fired for — one per reset.
+    private static var headsUpSent: [String: Date] = [:]
+    // Spike alerts re-arm only after the rolling burn cools off.
+    private static var spikeArmed: [String: Bool] = [:]
 
     static func requestPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -1074,13 +1108,34 @@ enum Notifier {
         // First launch: defaults register as true
         let on = { d.object(forKey: $0) == nil ? true : d.bool(forKey: $0) }
         let nudgeNow = !d.bool(forKey: "meowbar.nudgeOnlyActive") || active
-        for (label, w) in [("session", u.session), ("weekly", u.weekly)] {
-            guard let w else { continue }
+        var wins: [(String, UsageWindow)] =
+            [("session", u.session), ("weekly", u.weekly)].compactMap {
+                pair in pair.1.map { (pair.0, $0) } }
+        for e in u.extras ?? [] { wins.append((e.label.lowercased(), e.window)) }
+        let now = Date()
+        for (label, w) in wins {
             let key = "\(u.name) \(label)"
             if let reset = w.resetsAt {
                 if on("meowbar.alertReset"), let prev = lastReset[key],
                    reset > prev.addingTimeInterval(60) {
                     notify("\(u.name) \(label) limit reset", body: "Fresh window started.")
+                }
+                // ~15m out: a last call to burn the window's leftovers (or a
+                // "back soon" when maxed). Marked sent even when skipped so a
+                // mid-range window doesn't fire at the boundary every launch.
+                if on("meowbar.alertPreReset"), nudgeNow {
+                    let t = reset.timeIntervalSince(now)
+                    if t > 0, t <= 15 * 60, headsUpSent[key] != reset {
+                        headsUpSent[key] = reset
+                        let left = 100 - w.usedPercent
+                        if left >= 15 {
+                            notify("\(u.name) \(label) resets in ~15m",
+                                   body: "\(Int(left))% unused — spend it before it rolls over.")
+                        } else if w.usedPercent >= 95 {
+                            notify("\(u.name) \(label) unlocks in ~15m",
+                                   body: "The window resets soon — queue your next task.")
+                        }
+                    }
                 }
                 lastReset[key] = reset
             }
@@ -1100,6 +1155,27 @@ enum Notifier {
             }
             lastLevel[key] = w.usedPercent < 70 ? 0 : max(prev, level)
         }
+    }
+
+    // Points burned in the last 30 min over the line where an even pace can't
+    // explain it — the runaway-task tripwire. Weekly budgets spike at 15 pts
+    // (~10x even pace); daily/session meters at 30. Re-arms once the rolling
+    // half-hour burn cools below half the threshold.
+    static func evaluateSpike(_ u: ProviderUsage, samples: [UsageSample], active: Bool = true) {
+        let d = UserDefaults.standard
+        let on = d.object(forKey: "meowbar.alertSpike") == nil || d.bool(forKey: "meowbar.alertSpike")
+        let weeklyBased = samples.contains { $0.weekly != nil }
+        let unit: String
+        if weeklyBased { unit = "weekly" }
+        else { unit = (u.session?.windowSeconds ?? 0) >= 86400 ? "daily" : "session" }
+        let threshold = weeklyBased ? 15.0 : 30.0
+        let burned = UsageHistory.recentBurn(samples, within: 1800)
+        if burned < threshold * 0.5 { spikeArmed[u.name] = false }
+        guard on, burned >= threshold, spikeArmed[u.name] != true else { return }
+        if d.bool(forKey: "meowbar.nudgeOnlyActive"), !active { return }
+        spikeArmed[u.name] = true
+        notify("\(u.name) is burning fast",
+               body: "+\(Int(burned.rounded()))% of the \(unit) limit in the last 30 min — check for a runaway task.")
     }
 
     private static func notify(_ title: String, body: String) {

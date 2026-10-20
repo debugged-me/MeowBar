@@ -64,6 +64,23 @@ enum UsageHistory {
         return totals
     }
 
+    // Points burned in the trailing `within` seconds — the spike detector's
+    // input. Burns are attributed to the later sample, so a burn that just
+    // ended a minute ago still counts.
+    static func recentBurn(_ samples: [UsageSample], within: TimeInterval,
+                           now: Date = Date()) -> Double {
+        burnBetween(now.addingTimeInterval(-within), now, in: samples)
+    }
+
+    // Points of the limit burned in (start, end] — what a task cost. Burns
+    // landing on the sample right after `end` aren't counted: the API lags
+    // the last messages, so per-task numbers can trail a hair.
+    static func burnBetween(_ start: Date, _ end: Date, in samples: [UsageSample]) -> Double {
+        burns(samples)
+            .filter { $0.t > start && $0.t <= end }
+            .reduce(0) { $0 + $1.points }
+    }
+
     // Burn per hour over the last `hours` (oldest first, current hour last) —
     // the sparkline's data.
     static func hourlyBurn(_ samples: [UsageSample], hours: Int = 24,
@@ -95,5 +112,41 @@ enum UsageHistory {
         }
         let (a, am) = parts(h), (b, bm) = parts(h + 3)
         return am == bm ? "\(a)–\(b) \(bm)" : "\(a) \(am)–\(b) \(bm)"
+    }
+}
+
+// A finished stretch of agent work: confirmed-running start to confirmed-idle
+// end. Logged at the transition; spans past retention drop on append.
+struct TaskSpan: Codable, Equatable {
+    var provider: String
+    var start: Date
+    var end: Date
+    var seconds: TimeInterval { end.timeIntervalSince(start) }
+}
+
+enum TaskStats {
+    static let retention: TimeInterval = 8 * 86400
+    // A span left open this long (relaunch mid-task) is abandoned, not logged.
+    static let maxSpan: TimeInterval = 8 * 3600
+
+    static func append(_ s: TaskSpan, to spans: inout [TaskSpan]) -> Bool {
+        guard s.seconds > 0, s.seconds <= maxSpan else { return false }
+        spans.append(s)
+        let cutoff = s.end.addingTimeInterval(-retention)
+        spans.removeAll { $0.end < cutoff }
+        return true
+    }
+
+    // Today's count + total working seconds for one provider.
+    static func today(_ spans: [TaskSpan], provider: String,
+                      now: Date = Date(), calendar: Calendar = .current)
+        -> (count: Int, seconds: TimeInterval) {
+        let day = calendar.startOfDay(for: now)
+        var n = 0, t = 0.0
+        for s in spans where s.provider == provider && s.end > day {
+            n += 1
+            t += s.seconds
+        }
+        return (n, t)
     }
 }

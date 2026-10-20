@@ -14,6 +14,12 @@ final class UsageStore: ObservableObject {
     @Published var devinLastActive: Date?
     @Published var lastUpdated: Date?
     @Published var history: [String: [UsageSample]] = [:]
+    // Finished work stretches per provider, for "3 tasks · 1h24m today".
+    @Published var taskSpans: [TaskSpan] = []
+    // In-flight task starts (memory only — a quit mid-task just isn't counted).
+    var taskStart: [String: Date] = [:]
+    // Bumps while the popover is open and an agent runs, so live durations tick.
+    @Published var liveTick = Date()
     @Published var clockStarting = false
     @Published var update: UpdateInfo?
     // Set briefly when a window resets (usage drops tens of points at once);
@@ -79,6 +85,9 @@ final class UsageStore: ObservableObject {
             }
         }
         history = AppFiles.load([String: [UsageSample]].self, from: AppFiles.history) ?? [:]
+        var spans = AppFiles.load([TaskSpan].self, from: AppFiles.taskLog) ?? []
+        spans.removeAll { Date().timeIntervalSince($0.end) > TaskStats.retention }
+        taskSpans = spans
         onUpdate?()
     }
 
@@ -99,6 +108,7 @@ final class UsageStore: ObservableObject {
         }
         claude.session = win(58, 3.2 * 3600, 18000)
         claude.weekly = win(29, 4.4 * 86400, 604800)
+        claude.extras = [NamedWindow(label: "Sonnet", window: win(46, 4.4 * 86400, 604800))]
         codex.session = win(14, 2.1 * 3600, 18000)
         codex.weekly = win(45, 5.2 * 86400, 604800)
         devin.note = "Pro"; devin.noteAccent = "unlimited"
@@ -120,6 +130,11 @@ final class UsageStore: ObservableObject {
             codexRunning = true
             arm("Claude", "limit reached", now: now)
         }
+        taskSpans = [
+            TaskSpan(provider: "Claude", start: now - 5400, end: now - 3300),
+            TaskSpan(provider: "Claude", start: now - 1800, end: now - 600),
+            TaskSpan(provider: "Codex", start: now - 7200, end: now - 6900),
+        ]
         lastUpdated = now
         demoActive = true
         onUpdate?()
@@ -183,6 +198,10 @@ final class UsageStore: ObservableObject {
                 Notifier.evaluate(self.codex, others: [self.claude], active: working)
                 Notifier.evaluate(self.devin, active: working)
                 self.persist(now: now)
+                for u in [self.claude, self.codex, self.devin] where u.hasData && !u.isStale {
+                    Notifier.evaluateSpike(u, samples: self.history[u.name] ?? [],
+                                           active: working)
+                }
                 self.maybeStartClock(now: now)
                 self.onUpdate?()
             }
@@ -255,10 +274,21 @@ final class UsageStore: ObservableObject {
                                ("Devin", activity.devin)] {
                     let wasRunning = self.confirmedRunning[sample.0] == true
                     if self.recordActivity(for: sample.0, isBusy: sample.1) {
+                        // The run just ended — bank the span for today's stats.
+                        if let st = self.taskStart[sample.0],
+                           TaskStats.append(TaskSpan(provider: sample.0, start: st, end: now),
+                                            to: &self.taskSpans) {
+                            AppFiles.save(self.taskSpans, to: AppFiles.taskLog)
+                        }
+                        self.taskStart[sample.0] = nil
                         self.arm(sample.0, "task done", now: now)
                         CatSound.play(.done)
                         self.refresh() // the finished task just moved the numbers
                     } else if !wasRunning, self.confirmedRunning[sample.0] == true,
+                              self.taskStart[sample.0] == nil {
+                        self.taskStart[sample.0] = now
+                    }
+                    if !wasRunning, self.confirmedRunning[sample.0] == true,
                               (self.alertUntil[sample.0] ?? .distantPast) <= now {
                         // A blip, not a badge: "running" lands when work starts
                         // and fades on its own — no fade-pulse, it's not an alert.
@@ -279,6 +309,7 @@ final class UsageStore: ObservableObject {
                 if self.claudeRunning != c { self.claudeRunning = c }
                 if self.codexRunning != x { self.codexRunning = x }
                 if self.devinRunning != d { self.devinRunning = d }
+                if self.popoverShown && (c || x || d) { self.liveTick = now }
                 self.onUpdate?()
             }
         }
@@ -554,10 +585,14 @@ final class UsageStore: ObservableObject {
                 let span = (w.windowSeconds ?? 0) >= 86400 ? "1d" : "\(Int((w.windowSeconds ?? 18000) / 3600))h"
                 return String(format: "%@ %.0f%% left", span, 100 - w.usedPercent)
             }
-            let nums = [lbl(u.session), lbl(u.weekly)].compactMap { $0 }.joined(separator: " · ")
+            var nums = [lbl(u.session), lbl(u.weekly)].compactMap { $0 }
+            for e in u.extras ?? [] {
+                nums.append("\(e.label.lowercased()) \(Int(max(0, 100 - e.window.usedPercent)))% left")
+            }
+            let numsJoined = nums.joined(separator: " · ")
             // No metered windows (Devin unlimited, errors) → reuse shareLine's
             // fallbacks ("Pro unlimited", the error) instead of "…".
-            return nums.isEmpty ? u.shareLine() : "\(u.name): " + nums
+            return numsJoined.isEmpty ? u.shareLine() : "\(u.name): " + numsJoined
         }
         return [claude, codex, devin].filter(shownInMenuBar).map(line).joined(separator: "    ")
     }

@@ -149,7 +149,7 @@ struct PopoverView: View {
     private var statusLine: (text: String, color: Color) {
         if let u = providers.first(where: { ($0.worstUsed ?? 0) >= 100 }) {
             // The one fact you opened this for: when you can work again.
-            let reset = [u.session, u.weekly].compactMap { $0?.resetsAt }
+            let reset = u.allWindows.compactMap(\.resetsAt)
                 .filter { $0 > Date() }.min()
             return ("\(u.name) maxed" + (reset.map { " · back in \(Countdown.compact(to: $0))" } ?? ""), .red)
         }
@@ -271,8 +271,15 @@ struct ProviderBlock: View {
         Bundle.main.image(forResource: usage.name.lowercased())
     }
 
-    // History only makes sense for providers with metered windows.
-    private var canExpand: Bool { usage.hasData && store != nil }
+    // History needs metered windows; task stats need spans. Either unlocks
+    // the chevron — Devin has no windows but can still log tasks.
+    private var canExpand: Bool { (usage.hasData || hasTodayTasks) && store != nil }
+
+    private var hasTodayTasks: Bool {
+        guard let store else { return false }
+        return store.taskStart[usage.name] != nil
+            || TaskStats.today(store.taskSpans, provider: usage.name).count > 0
+    }
 
     // Right-click → jump into the tool: CLIs land in Terminal, Devin opens its app.
     private var openAction: ProviderAction? {
@@ -286,6 +293,67 @@ struct ProviderBlock: View {
 
     private var openTitle: String {
         usage.name == "Devin" ? "Open Devin" : "Open \(usage.name) in Terminal"
+    }
+
+    // "12m" / "1h24m" for the running chip — plain "running" for the first
+    // minute, so it never reads "running · <1m".
+    private var liveDuration: String? {
+        guard running, let st = store?.taskStart[usage.name] else { return nil }
+        let elapsed = Date().timeIntervalSince(st)
+        guard elapsed >= 60 else { return nil }
+        return Countdown.compact(to: Date().addingTimeInterval(elapsed))
+    }
+
+    // "now" under a minute, then compact — for the meta line's live part.
+    private func liveDur(_ secs: TimeInterval) -> String {
+        secs < 60 ? "now"
+            : Countdown.compact(to: Date().addingTimeInterval(secs))
+    }
+
+    // " · 5h" / " · 7d" — the span suffix an extra window's row title carries.
+    private func extraSpanSuffix(_ w: UsageWindow) -> String {
+        guard let s = w.windowSeconds else { return "" }
+        return s >= 86400 ? " · \(Int(s / 86400))d" : " · \(Int(s / 3600))h"
+    }
+
+    // "working 12m · burned 4% · 3 tasks · 1h24m today" — nil when there's
+    // nothing to say. Burns are joined to the span by sample timestamps.
+    private var taskLine: String? {
+        guard let store else { return nil }
+        let (count, secs) = TaskStats.today(store.taskSpans, provider: usage.name)
+        let samples = store.history[usage.name] ?? []
+        var parts: [String] = []
+        var total = secs
+        if running, let st = store.taskStart[usage.name] {
+            let elapsed = Date().timeIntervalSince(st)
+            var live = "working \(liveDur(elapsed))"
+            let burned = UsageHistory.burnBetween(st, Date(), in: samples)
+            if burned >= 0.5 { live += " · burned \(Int(burned.rounded()))%" }
+            parts.append(live)
+            total += elapsed
+        }
+        if count > 0 {
+            parts.append("\(count) task\(count == 1 ? "" : "s")")
+            if total >= 60 {
+                parts.append(Countdown.compact(to: Date().addingTimeInterval(total)))
+            }
+            parts[parts.count - 1] += " today"
+        }
+        if !running {
+            let day = Calendar.current.startOfDay(for: Date())
+            if let last = store.taskSpans.last(where: {
+                    $0.provider == usage.name && $0.end > day }) {
+                let burned = UsageHistory.burnBetween(last.start, last.end, in: samples)
+                if burned >= 0.5 { parts.append("last burned \(Int(burned.rounded()))%") }
+            }
+        }
+        if !parts.isEmpty { return parts.joined(separator: " · ") }
+        // Devin has no metered windows — give the row something to say: when
+        // the last agent turn happened, read from its session log.
+        if usage.name == "Devin", !usage.hasData, !running, let at = store.devinLastActive {
+            return "Last active \(Countdown.ago(at))"
+        }
+        return nil
     }
 
     var body: some View {
@@ -324,9 +392,10 @@ struct ProviderBlock: View {
                 if running {
                     HStack(spacing: 3) {
                         LiveDot(color: successColor(colorScheme), live: store?.popoverShown ?? false)
-                        Text("running")
+                        Text("running" + (liveDuration.map { " · \($0)" } ?? ""))
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(successColor(colorScheme))
+                            .lineLimit(1)
                     }
                 } else if usage.isStale, Date().timeIntervalSince(usage.fetchedAt) >= 60 {
                     Label(Countdown.ago(usage.fetchedAt), systemImage: "clock")
@@ -371,8 +440,18 @@ struct ProviderBlock: View {
             }
 
             if expanded.wrappedValue && canExpand {
-                HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
-                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
+                // Today's work: "3 tasks · 1h24m · last burned 4%".
+                if let line = taskLine {
+                    Text(line)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(supportingText(colorScheme))
+                        .lineLimit(1)
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
+                }
+                if usage.hasData {
+                    HistoryStrip(samples: store?.history[usage.name] ?? [], tint: brandColor)
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
+                }
             }
 
             if let err = usage.error {
@@ -399,6 +478,12 @@ struct ProviderBlock: View {
                           animating: store?.popoverShown == true)
                 WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor,
                           animating: store?.popoverShown == true)
+                ForEach(usage.extras ?? [], id: \.label) { e in
+                    WindowRow(provider: usage.name,
+                              title: e.label + extraSpanSuffix(e.window),
+                              w: e.window, tint: brandColor,
+                              animating: store?.popoverShown == true)
+                }
             }
         }
         .padding(.horizontal, 10)

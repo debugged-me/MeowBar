@@ -124,6 +124,44 @@ final class ProviderTests: XCTestCase {
         XCTAssertEqual(ProviderUsage(name: "Codex").shareLine(now: now), "Codex: no data")
     }
 
+    func testExtrasJoinWorstAndBlocker() {
+        var u = ProviderUsage(name: "Claude")
+        u.session = UsageWindow(usedPercent: 20)
+        u.weekly = UsageWindow(usedPercent: 50)
+        XCTAssertEqual(u.worstUsed, 50)
+        u.extras = [NamedWindow(label: "Sonnet", window: UsageWindow(usedPercent: 96))]
+        XCTAssertEqual(u.worstUsed, 96)
+        XCTAssertEqual(u.displayLeft, 4)       // the maxed extra is the blocker
+        u.extras = [NamedWindow(label: "Sonnet", window: UsageWindow(usedPercent: 60))]
+        XCTAssertEqual(u.displayLeft, 80)      // under 90 → session still shows
+    }
+
+    func testExtrasNormalized() {
+        var u = ProviderUsage(name: "Claude")
+        u.extras = [NamedWindow(label: "Sonnet", window: UsageWindow(
+            usedPercent: 70, resetsAt: now.addingTimeInterval(-60), windowSeconds: 604800))]
+        let n = u.normalized(now: now)
+        XCTAssertEqual(n.extras?.first?.window.usedPercent, 0)
+        XCTAssertNotNil(n.extras?.first?.window.resetsAt) // weekly rolls forward
+    }
+
+    func testExtraWindowKeys() {
+        XCTAssertEqual(ExtraWindows.label(forKey: "seven_day_sonnet"), "Sonnet")
+        XCTAssertEqual(ExtraWindows.label(forKey: "seven_day_oauth_apps"), "OAuth apps")
+        XCTAssertEqual(ExtraWindows.label(forKey: "five_hour_extra"), "Extra")
+        XCTAssertNil(ExtraWindows.label(forKey: "seven_day"))
+        XCTAssertNil(ExtraWindows.label(forKey: "rate_limit"))
+        XCTAssertEqual(ExtraWindows.windowSeconds(forKey: "seven_day_opus"), 604800)
+        XCTAssertEqual(ExtraWindows.windowSeconds(forKey: "five_hour_x"), 18000)
+    }
+
+    func testShareLineWithExtras() {
+        var u = ProviderUsage(name: "Claude")
+        u.session = UsageWindow(usedPercent: 69)
+        u.extras = [NamedWindow(label: "Sonnet", window: UsageWindow(usedPercent: 60))]
+        XCTAssertEqual(u.shareLine(now: now), "Claude: session 31% left · sonnet 40% left")
+    }
+
     func testCacheRoundTripDropsPerFetchState() throws {
         var u = ProviderUsage(name: "Codex")
         u.session = UsageWindow(usedPercent: 12, resetsAt: now, windowSeconds: 18000)
@@ -171,8 +209,9 @@ final class SessionClockTests: XCTestCase {
 }
 
 final class HistoryTests: XCTestCase {
-    private func at(_ day: Int, _ hour: Int) -> Date {
-        utc.date(from: DateComponents(year: 2026, month: 10, day: day, hour: hour))!
+    private func at(_ day: Int, _ hour: Int, _ minute: Int = 0) -> Date {
+        utc.date(from: DateComponents(year: 2026, month: 10, day: day,
+                                      hour: hour, minute: minute))!
     }
 
     func testAppendSkipsUnchangedUntilHeartbeat() {
@@ -236,6 +275,57 @@ final class HistoryTests: XCTestCase {
         // Too little signal → nil
         XCTAssertNil(UsageHistory.busiestBlock(Array(samples.prefix(2)), calendar: utc))
         XCTAssertEqual(UsageHistory.busiestBlock(samples, calendar: utc), 14)
+    }
+
+    func testBurnBetweenBounds() {
+        // Task span 10:00–10:30: the +5 at exactly 10:30 counts, the +3
+        // landing at 10:45 (post-task API lag) does not.
+        let samples = [
+            UsageSample(t: at(19, 10), session: 0, weekly: 10),
+            UsageSample(t: at(19, 10, 15), session: 0, weekly: 14),
+            UsageSample(t: at(19, 10, 30), session: 0, weekly: 19),
+            UsageSample(t: at(19, 10, 45), session: 0, weekly: 22),
+        ]
+        XCTAssertEqual(UsageHistory.burnBetween(at(19, 10), at(19, 10, 30), in: samples), 9)
+    }
+
+    func testRecentBurnWindow() {
+        let samples = [
+            UsageSample(t: at(19, 8), session: 0, weekly: 40),
+            UsageSample(t: at(19, 18), session: 0, weekly: 50),  // +10, 2h ago — outside
+            UsageSample(t: at(19, 19, 40), session: 0, weekly: 56), // +6, 20m ago
+            UsageSample(t: at(19, 19, 55), session: 0, weekly: 62), // +6, 5m ago
+        ]
+        XCTAssertEqual(UsageHistory.recentBurn(samples, within: 1800, now: at(19, 20)), 12)
+        XCTAssertEqual(UsageHistory.recentBurn(samples, within: 6 * 3600, now: at(19, 20)), 22)
+    }
+
+    func testTaskStatsToday() {
+        let spans = [
+            TaskSpan(provider: "Claude", start: at(19, 9), end: at(19, 10)),
+            TaskSpan(provider: "Claude", start: at(19, 11), end: at(19, 11, 30)),
+            TaskSpan(provider: "Claude", start: at(18, 22), end: at(18, 23)), // yesterday
+            TaskSpan(provider: "Codex", start: at(19, 9), end: at(19, 9, 20)),
+        ]
+        let (count, secs) = TaskStats.today(spans, provider: "Claude", now: at(19, 20), calendar: utc)
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(secs, 5400, accuracy: 1)
+    }
+
+    func testTaskSpanAppendDropsBadAndOld() {
+        var spans: [TaskSpan] = []
+        XCTAssertFalse(TaskStats.append(
+            TaskSpan(provider: "Claude", start: now, end: now.addingTimeInterval(-10)), to: &spans))
+        XCTAssertFalse(TaskStats.append(
+            TaskSpan(provider: "Claude", start: now.addingTimeInterval(-9 * 3600), end: now), to: &spans))
+        XCTAssertTrue(TaskStats.append(
+            TaskSpan(provider: "Claude", start: now.addingTimeInterval(-600), end: now), to: &spans))
+        XCTAssertEqual(spans.count, 1)
+        var old = [TaskSpan(provider: "Codex", start: now.addingTimeInterval(-9 * 86400),
+                            end: now.addingTimeInterval(-9 * 86400 + 60))]
+        XCTAssertTrue(TaskStats.append(
+            TaskSpan(provider: "Codex", start: now.addingTimeInterval(-60), end: now), to: &old))
+        XCTAssertEqual(old.count, 1) // the 9-day-old span dropped on append
     }
 
     func testBlockLabels() {

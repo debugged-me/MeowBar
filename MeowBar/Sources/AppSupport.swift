@@ -7,6 +7,7 @@ enum AppFiles {
     static let dir = StatuslineBridge.supportDir
     static let usageCache = dir + "/usage-cache.json"
     static let history = dir + "/history.json"
+    static let taskLog = dir + "/tasklog.json"
 
     static func load<T: Decodable>(_ type: T.Type, from path: String) -> T? {
         guard let data = FileManager.default.contents(atPath: path) else { return nil }
@@ -47,7 +48,8 @@ enum UsageJSON {
              "plan": u.note ?? NSNull(),
              "fetched_at": iso.string(from: u.fetchedAt),
              "session": window(u.session),
-             "weekly": window(u.weekly)]
+             "weekly": window(u.weekly),
+             "extras": (u.extras ?? []).map { ["label": $0.label, "window": window($0.window)] }]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: ["providers": providers],
                                                      options: [.prettyPrinted, .sortedKeys]) else { return false }

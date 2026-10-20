@@ -16,6 +16,8 @@ struct SettingsView: View {
     @AppStorage("meowbar.alert90") var alert90 = true
     @AppStorage("meowbar.alert95") var alert95 = true
     @AppStorage("meowbar.alertReset") var alertReset = true
+    @AppStorage("meowbar.alertPreReset") var alertPreReset = true
+    @AppStorage("meowbar.alertSpike") var alertSpike = true
     @AppStorage("meowbar.meowSound") var meowSound = false
     @AppStorage("meowbar.purrSound") var purrSound = false
     @AppStorage("meowbar.sadSound") var sadSound = false
@@ -74,6 +76,14 @@ struct SettingsView: View {
                 Toggle("Nudge at 90% used", isOn: $alert90)
                 Toggle("Nudge at 95% used", isOn: $alert95)
                 Toggle("When a limit resets", isOn: $alertReset)
+                Toggle("15m before a limit resets", isOn: $alertPreReset)
+                Toggle(isOn: $alertSpike) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Nudge on a burn spike")
+                        Text("More than 15% of the weekly budget gone in 30 minutes — a runaway task eats a limit quietly.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Toggle(isOn: $nudgeOnlyActive) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Only nudge while an agent is working")
@@ -183,6 +193,8 @@ struct SettingsView: View {
         .onChange(of: alert90) { changed() }
         .onChange(of: alert95) { changed() }
         .onChange(of: alertReset) { changed() }
+        .onChange(of: alertPreReset) { changed() }
+        .onChange(of: alertSpike) { changed() }
         .onChange(of: meowSound) { changed() }
         .onChange(of: purrSound) { changed() }
         .onChange(of: sadSound) { changed() }
