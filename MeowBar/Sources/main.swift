@@ -643,6 +643,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKey = HotKey()
     private var islandPanel: NSPanel?
     private var islandField: NSTextField?
+    private var islandExpanded = false
+    private var islandAnimating = false
+    private var islandCollapseWork: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -946,15 +949,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.dismissPopover()
                 self.showStatusMenu(in: self.islandPanel?.contentView)
             }
+            bg.onHoverChange = { [weak self] inside in self?.islandHover(inside) }
             let tf = NSTextField(labelWithAttributedString: NSAttributedString())
             tf.drawsBackground = false
+            tf.alphaValue = 0
             bg.addSubview(tf)
             p.contentView = bg
             islandPanel = p
             islandField = tf
+            bg.setContentVisible(false, animated: false)
         }
         islandPanel?.orderFrontRegardless()
         layoutIsland()
+    }
+
+    // The notch band + width: auxiliaryTopLeft/RightArea are the menu-bar
+    // strips beside the camera housing, so the gap between them IS the
+    // notch. Fall back to a plausible width on notch-free screens.
+    private struct IslandGeometry { let cx: CGFloat, notchW: CGFloat, drop: CGFloat }
+    private func islandGeometry(_ screen: NSScreen) -> IslandGeometry {
+        let drop = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness)
+        var w: CGFloat = 190, cx = screen.frame.midX
+        if let l = screen.auxiliaryTopLeftArea, let r = screen.auxiliaryTopRightArea,
+           r.minX - l.maxX > 40 {
+            w = r.minX - l.maxX
+            cx = l.maxX + w / 2
+        }
+        return IslandGeometry(cx: cx, notchW: w, drop: drop)
+    }
+
+    // The panel always reaches up to the screen's top edge: the band region
+    // is transparent and acts as the hover target over the notch itself,
+    // while the visible black body hangs below the band (islandFrame only
+    // sizes the window — IslandView draws the body in the lower part).
+    private func islandFrame(expanded: Bool, screen: NSScreen, g: IslandGeometry) -> NSRect {
+        let top = screen.frame.maxY
+        if expanded {
+            let textW = islandField?.fittingSize.width ?? 0
+            let w = max(g.notchW + 16, textW + 24 + 17)
+            let h = g.drop + 30
+            return NSRect(x: g.cx - w / 2, y: top - h, width: w, height: h)
+        }
+        let h = g.drop + 10
+        return NSRect(x: g.cx - g.notchW / 2, y: top - h, width: g.notchW, height: h)
+    }
+
+    private func islandHover(_ inside: Bool) {
+        islandCollapseWork?.cancel()
+        islandCollapseWork = nil
+        if inside {
+            setIslandExpanded(true)
+            return
+        }
+        // Re-check after a beat: an exit can fire spuriously while the panel
+        // shrinks under the cursor, and an open popover pins it expanded.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let p = self.islandPanel, p.isVisible else { return }
+            if !p.frame.contains(NSEvent.mouseLocation), !self.popover.isShown {
+                self.setIslandExpanded(false)
+            }
+        }
+        islandCollapseWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func setIslandExpanded(_ expanded: Bool) {
+        guard expanded != islandExpanded, let p = islandPanel, p.isVisible,
+              let screen = NSScreen.main else { return }
+        islandExpanded = expanded
+        islandCollapseWork?.cancel()
+        islandCollapseWork = nil
+        let g = islandGeometry(screen)
+        let target = islandFrame(expanded: expanded, screen: screen, g: g)
+        islandAnimating = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = expanded ? 0.25 : 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: expanded ? .easeOut : .easeIn)
+            ctx.allowsImplicitAnimation = true
+            p.animator().setFrame(target, display: true)
+            self.islandField?.animator().alphaValue = expanded ? 1 : 0
+        }, completionHandler: { [weak self] in
+            self?.islandAnimating = false
+            self?.layoutIsland()
+        })
+        (p.contentView as? IslandView)?.setContentVisible(expanded, animated: true)
     }
 
     private func layoutIsland(title prebuilt: NSAttributedString? = nil) {
@@ -964,16 +1042,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let title = prebuilt ?? store.menuTitle
         tf.attributedStringValue = title
         tf.sizeToFit() // attributed .size() under-measures image attachments
+        let g = islandGeometry(screen)
+        bg?.bandHeight = g.drop
+        if !islandAnimating {
+            let target = islandFrame(expanded: islandExpanded, screen: screen, g: g)
+            if !p.frame.equalTo(target) { p.setFrame(target, display: true) }
+            tf.alphaValue = islandExpanded ? 1 : 0
+            bg?.setContentVisible(islandExpanded, animated: false)
+        }
+        let bodyH = p.frame.height - g.drop
         let sz = tf.fittingSize
-        let pad: CGFloat = 12, h: CGFloat = 26, catPad: CGFloat = 17
-        let w = sz.width + pad * 2 + catPad
-        // Hang just below the notch/menu area: safeAreaInsets.top covers the
-        // notch on modern MacBooks, 0 elsewhere (sits flush at top edge).
-        let drop = screen.safeAreaInsets.top
-        let y = screen.frame.maxY - drop - h - 2
-        p.setFrame(NSRect(x: screen.frame.midX - w / 2, y: y, width: w, height: h),
-                   display: true)
-        tf.frame = NSRect(x: pad + catPad, y: 3, width: sz.width, height: h - 6)
+        tf.frame = NSRect(x: 29, y: (bodyH - sz.height) / 2,
+                          width: sz.width, height: sz.height)
         bg?.showCat(true)
         bg?.setSeverity([store.claude, store.codex, store.devin].compactMap(\.worstUsed).max())
     }
@@ -1061,8 +1141,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.acknowledgeAlerts()
         store.refresh()
-        if let bg = islandPanel?.contentView, islandPanel?.isVisible == true {
-            popoverAnchor = bg
+        if let bg = islandPanel?.contentView as? IslandView, islandPanel?.isVisible == true {
+            // Anchor to the black body, not the hover strip — the arrow
+            // should point at the island, not the notch band above it.
+            popoverAnchor = bg.body
+            setIslandExpanded(true)
         } else {
             popoverAnchor = statusItem.button
         }
@@ -1136,31 +1219,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 }
 
-// The island's capsule view: glass background, dimmed at rest, brightens on
-// hover, click opens the popover.
-private final class IslandView: NSVisualEffectView {
+// The island view. The panel is taller than what draws: the top `bandHeight`
+// points are a transparent hover strip over the notch/menu bar, and `body` —
+// a black slab rounded only at the bottom — hangs below it so at rest it
+// reads as a chin on the notch itself. Everything inside is forced dark so
+// the label colors resolve to light-on-black.
+private final class IslandView: NSView {
     var onClick: (() -> Void)?
     var onRightClick: (() -> Void)?
+    var onHoverChange: ((Bool) -> Void)?
+    // Height of the transparent band above the body (notch/menu-bar strip).
+    var bandHeight: CGFloat = 24
+    let body = NSView()
     // A hairline under the text tinted by the worst window across providers:
     // the island alone tells you someone is near a limit.
     private let severityBar = NSView()
     private var catView: NSImageView?
+    private let bodyMask = CAShapeLayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        material = .popover
-        blendingMode = .behindWindow
-        state = .active
         wantsLayer = true
-        layer?.cornerRadius = 13
-        alphaValue = 0.85
+        appearance = NSAppearance(named: .darkAqua)
+        body.wantsLayer = true
+        body.layer?.backgroundColor = NSColor.black.cgColor
+        body.layer?.mask = bodyMask
+        addSubview(body)
         addTrackingArea(NSTrackingArea(rect: .zero,
                                        options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
         severityBar.wantsLayer = true
         severityBar.layer?.cornerRadius = 1
         severityBar.isHidden = true
-        addSubview(severityBar)
+        body.addSubview(severityBar)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -1174,7 +1265,7 @@ private final class IslandView: NSVisualEffectView {
         severityBar.isHidden = false
         severityBar.layer?.backgroundColor = (worst >= 90 ? NSColor.systemRed
             : worst >= 75 ? NSColor.systemOrange
-            : NSColor.labelColor.withAlphaComponent(0.35)).cgColor
+            : NSColor.white.withAlphaComponent(0.4)).cgColor
     }
 
     // Cat mark at the island's leading edge, tinted like the text.
@@ -1183,21 +1274,62 @@ private final class IslandView: NSVisualEffectView {
             let img = CatGlyph.image(size: 15)
             let iv = NSImageView(image: img)
             iv.contentTintColor = .secondaryLabelColor
-            addSubview(iv)
+            body.addSubview(iv)
             catView = iv
         }
         catView?.isHidden = !show
     }
 
+    // Text/cat/severity only exist in the expanded state — collapse fades
+    // them rather than clipping mid-shrink.
+    func setContentVisible(_ visible: Bool, animated: Bool) {
+        let a: CGFloat = visible ? 1 : 0
+        guard animated else {
+            severityBar.alphaValue = a
+            catView?.alphaValue = a
+            return
+        }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = visible ? 0.22 : 0.1
+            severityBar.animator().alphaValue = a
+            self.catView?.animator().alphaValue = a
+        }
+    }
+
+    // Square top, rounded bottom: the body's top edge abuts the notch's
+    // bottom edge, so rounding there would show daylight between them.
+    private func updateBodyMask() {
+        let b = body.bounds
+        let r = min(11, b.height / 2, b.width / 2)
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: 0, y: b.height))
+        p.addLine(to: CGPoint(x: b.width, y: b.height))
+        p.addLine(to: CGPoint(x: b.width, y: r))
+        p.addArc(center: CGPoint(x: b.width - r, y: r), radius: r,
+                 startAngle: 0, endAngle: -.pi / 2, clockwise: false)
+        p.addLine(to: CGPoint(x: r, y: 0))
+        p.addArc(center: CGPoint(x: r, y: r), radius: r,
+                 startAngle: -.pi / 2, endAngle: .pi, clockwise: false)
+        p.closeSubpath()
+        bodyMask.path = p
+    }
+
     override func layout() {
         super.layout()
-        let h = bounds.height
-        severityBar.frame = NSRect(x: 10, y: 2.5, width: bounds.width - 20, height: 1.5)
+        // The body fills the whole view, band included: the part that lands
+        // inside the physical notch cutout is invisible, so expanding reads
+        // as the notch itself swelling down and sideways — not a pill below.
+        body.frame = bounds
+        updateBodyMask()
+        // Content still lives in the below-band region — anything higher is
+        // inside the notch cutout where it can't be seen.
+        let h = max(0, body.bounds.height - bandHeight)
+        severityBar.frame = NSRect(x: 10, y: 2.5, width: body.bounds.width - 20, height: 1.5)
         if let catView { catView.frame = NSRect(x: 9, y: (h - 12) / 2, width: 14, height: 12) }
     }
 
-    override func mouseEntered(with event: NSEvent) { animator().alphaValue = 1.0 }
-    override func mouseExited(with event: NSEvent) { animator().alphaValue = 0.85 }
+    override func mouseEntered(with event: NSEvent) { onHoverChange?(true) }
+    override func mouseExited(with event: NSEvent) { onHoverChange?(false) }
     override func mouseUp(with event: NSEvent) {
         if event.clickCount == 1 { onClick?() }
     }
@@ -1232,6 +1364,9 @@ extension AppDelegate: NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         store.popoverShown = false
         popoverClosing = false
+        if let p = islandPanel, p.isVisible, !p.frame.contains(NSEvent.mouseLocation) {
+            setIslandExpanded(false)
+        }
         if reopenAfterClose {
             reopenAfterClose = false
             togglePopover()
