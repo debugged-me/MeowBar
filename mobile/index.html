@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0a0a">
+<title>MeowBar</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a0a; color: #eee;
+         padding: max(16px, env(safe-area-inset-top)) 16px 32px; max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 20px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .age { color: #777; font-size: 12px; margin-bottom: 20px; }
+  .card { background: #161616; border: 1px solid #262626; border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .name { font-weight: 600; font-size: 15px; }
+  .note { color: #888; font-size: 12px; }
+  .pct { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .pct.low { color: #ff5f57; }
+  .bar { height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
+  .bar:last-child { margin-bottom: 0; }
+  .fill { height: 100%; background: #4fb29e; border-radius: 3px; transition: width .4s; }
+  .fill.low { background: #ff5f57; }
+  .wlabel { font-size: 11px; color: #888; display: flex; justify-content: space-between; margin-bottom: 4px; }
+  details { margin-top: 22px; background: #161616; border: 1px solid #262626; border-radius: 14px; padding: 14px; }
+  summary { font-weight: 600; font-size: 14px; cursor: pointer; }
+  ol { margin: 12px 0 0 18px; font-size: 13px; line-height: 1.8; color: #bbb; }
+  a { color: #4fb29e; }
+  code { background: #222; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  button { background: #4fb29e; color: #04110d; border: 0; border-radius: 8px;
+           padding: 8px 14px; font-size: 14px; font-weight: 600; }
+  #copied { color: #4fb29e; font-size: 13px; }
+  .fallback { margin-top: 14px; font-size: 12px; color: #888; }
+  #scriptbox { width: 100%; height: 110px; margin-top: 6px; background: #0d0d0d; color: #999;
+               border: 1px solid #333; border-radius: 8px; font-size: 11px;
+               font-family: Menlo, monospace; padding: 8px; }
+  .err { color: #ff5f57; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>🐱 MeowBar</h1>
+<div class="age" id="age">loading…</div>
+<div id="cards"></div>
+
+<details>
+  <summary>Put this on your lock screen</summary>
+  <ol>
+    <li>Install <a href="https://apps.apple.com/app/scriptable/id1405459188">Scriptable</a> (free)</li>
+    <li><button id="copybtn">Copy widget script</button> <span id="copied"></span></li>
+    <li>In Scriptable: <code>+</code> → long-press the empty editor → Paste → name it <code>MeowBar</code></li>
+    <li>Hold your lock screen → Customize → add widget → Scriptable → choose <code>MeowBar</code></li>
+  </ol>
+  <div class="fallback">Button not working? Tap in the box → Select All → Copy:
+    <textarea id="scriptbox" readonly></textarea>
+  </div>
+</details>
+
+<script>
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const left = w => w ? Math.max(0, 100 - Math.round(w.usedPercent)) : null;
+const fmtReset = ts => {
+  const d = ts - Date.now() / 1000;
+  if (d <= 0) return "resetting…";
+  const h = Math.floor(d / 3600), m = Math.round((d % 3600) / 60);
+  return h >= 24 ? Math.floor(h / 24) + "d " + (h % 24) + "h" : h > 0 ? h + "h " + m + "m" : m + "m";
+};
+function winRow(label, w) {
+  if (!w) return "";
+  const p = left(w), low = p <= 10;
+  return `<div class="wlabel"><span>${label}</span><span>${low ? "resets in " : ""}${fmtReset(w.resetsAt)}</span></div>
+    <div class="bar"><div class="fill${low ? " low" : ""}" style="width:${p}%"></div></div>`;
+}
+async function tick() {
+  try {
+    const r = await fetch("usage.json?t=" + Date.now());
+    const data = await r.json();
+    const age = Math.round((Date.now() / 1000 - Math.max(...data.map(p => p.fetchedAt || 0))) / 60);
+    document.getElementById("age").textContent = age <= 1 ? "updated just now" : "updated " + age + "m ago";
+    document.getElementById("cards").innerHTML = data.map(p => {
+      const s = left(p.session), wk = left(p.weekly);
+      const hero = s !== null ? s : wk;
+      const pct = hero !== null
+        ? `<span class="pct${hero <= 10 ? " low" : ""}">${hero}%</span>`
+        : `<span class="pct">${esc(p.noteAccent === "unlimited" ? "∞" : (p.note || "—"))}</span>`;
+      return `<div class="card">
+        <div class="row"><span><span class="name">${esc(p.name)}</span>
+        <span class="note"> · ${esc(p.note || "")}</span></span>${pct}</div>
+        ${winRow("5h left", p.session)}${winRow("weekly left", p.weekly)}
+      </div>`;
+    }).join("");
+  } catch (e) {
+    document.getElementById("age").innerHTML = '<span class="err">can\'t reach MeowBar — on the same WiFi?</span>';
+  }
+}
+tick();
+setInterval(tick, 30000);
+
+// iOS-safe copy (clipboard API needs HTTPS; this works over http://)
+let scriptText = "";
+fetch("meowbar-widget.js?t=" + Date.now()).then(r => r.text()).then(t => {
+  scriptText = t;
+  document.getElementById("scriptbox").value = t;
+});
+document.getElementById("copybtn").onclick = () => {
+  const msg = document.getElementById("copied");
+  const ta = document.createElement("textarea");
+  ta.value = scriptText;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:absolute;left:-9999px;top:" + (window.pageYOffset || 0) + "px;font-size:12pt";
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  const ok = document.execCommand("copy");
+  ta.remove();
+  msg.textContent = ok ? "copied ✓" : "didn't work — use the box below";
+  setTimeout(() => msg.textContent = "", 4000);
+};
+</script>
+</body>
+</html>
