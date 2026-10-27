@@ -699,12 +699,18 @@ enum UsageService {
         u.note = claudePlanName()
         // Bridge installed → Claude Code pushes fresh numbers on every render;
         // no API polling at all (this is what kills the 429s). Snapshot wins.
+        // A snapshot that never arrives means the status line never renders —
+        // editor panels (VS Code & friends) run claude headless, so Always
+        // fresh only fires in the terminal app. Say so instead of falling
+        // through to OAuth silently.
+        var bridgeSilent = false
         if StatuslineBridge.isInstalled {
             if let bridged = claudeFromSnapshot() { return bridged }
             if StatuslineBridge.isBroken {
                 u.error = "Status line tracking points at a missing helper — toggle it off/on in Settings"
                 return u
             }
+            bridgeSilent = StatuslineBridge.snapshot() == nil
             // bridge on, nothing pushed yet → fall through to OAuth meanwhile
         }
         do {
@@ -754,6 +760,12 @@ enum UsageService {
                 default: break
                 }
             }
+        }
+        // OAuth carried this fetch while the bridge stays silent — flag it so
+        // the user learns why Always fresh isn't delivering (no action needed;
+        // informational, not a failure).
+        if bridgeSilent, u.error == nil, u.hasData {
+            u.error = "Always fresh is on but nothing has pushed yet — the status line only runs in terminal `claude`, not in editor panels"
         }
         return u
     }

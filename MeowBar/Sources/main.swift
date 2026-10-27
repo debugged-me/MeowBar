@@ -457,10 +457,12 @@ final class UsageStore: ObservableObject {
                         .foregroundColor: NSColor.tertiaryLabelColor, .font: faint]))
                 }
                 let sev = u.worstUsed
-                let c: NSColor = sev == nil ? .secondaryLabelColor
+                let stale = u.isStale && Date().timeIntervalSince(u.fetchedAt) >= 60
+                let c: NSColor = stale ? .secondaryLabelColor
+                    : sev == nil ? .secondaryLabelColor
                     : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
                 s.append(NSAttributedString(
-                    string: u.displayLeft.map { String(format: "%.0f%%", $0) }
+                    string: u.displayLeft.map { (stale ? "~" : "") + String(format: "%.0f%%", $0) }
                         ?? (u.noteAccent == "unlimited" ? "∞" : "–"),
                     attributes: [.foregroundColor: c, .font: small]))
             }
@@ -470,10 +472,13 @@ final class UsageStore: ObservableObject {
         // Always keep the usage metric visible. Transient state is appended,
         // so an alert or running task never hides the useful percentage.
         func entry(_ resource: String, _ name: String, _ pct: Double?, _ sev: Double?,
-                   _ resetAt: Date?, _ eta: TimeInterval?) -> NSAttributedString {
+                   _ resetAt: Date?, _ eta: TimeInterval?, _ stale: Bool) -> NSAttributedString {
             // Freshly-reset limits glow green for a minute — a flash, not a state.
             let celebrating = (celebrateUntil ?? .distantPast) > Date()
-            let color: NSColor = celebrating ? .systemGreen
+            // Stale (rate-limited, last-good cache) reads muted: "~24%" in
+            // grey is an approximation, never a live-looking frozen number.
+            let color: NSColor = stale ? .secondaryLabelColor
+                : celebrating ? .systemGreen
                 : sev == nil ? .secondaryLabelColor
                 : sev! >= 90 ? .systemRed : sev! >= 75 ? .systemOrange : .labelColor
             let s = NSMutableAttributedString()
@@ -503,7 +508,7 @@ final class UsageStore: ObservableObject {
                     ?? (resource == "devin" && devin.noteAccent == "unlimited" ? "∞" : "–")
             }
             s.append(NSAttributedString(
-                string: " " + metric,
+                string: " " + (stale && pct != nil ? "~" : "") + metric,
                 attributes: [
                     .foregroundColor: color,
                     // Tabular digits a touch under menu-bar size: 98% → 97%
@@ -572,8 +577,9 @@ final class UsageStore: ObservableObject {
                     .font: NSFont.monospacedDigitSystemFont(
                         ofSize: NSFont.smallSystemFontSize - 1, weight: .regular)]))
             }
+            let stale = e.2.isStale && Date().timeIntervalSince(e.2.fetchedAt) >= 60
             t.append(entry(e.0, e.1, e.2.displayLeft, e.2.worstUsed,
-                           e.2.displayReset, e.2.displayTimeToEmpty))
+                           e.2.displayReset, e.2.displayTimeToEmpty, stale))
         }
         return t
     }
@@ -590,9 +596,11 @@ final class UsageStore: ObservableObject {
                 nums.append("\(e.label.lowercased()) \(Int(max(0, 100 - e.window.usedPercent)))% left")
             }
             let numsJoined = nums.joined(separator: " · ")
+            let staleTag = u.isStale && Date().timeIntervalSince(u.fetchedAt) >= 60
+                ? " — as of " + Countdown.ago(u.fetchedAt) : ""
             // No metered windows (Devin unlimited, errors) → reuse shareLine's
             // fallbacks ("Pro unlimited", the error) instead of "…".
-            return numsJoined.isEmpty ? u.shareLine() : "\(u.name): " + numsJoined
+            return numsJoined.isEmpty ? u.shareLine() : "\(u.name): " + numsJoined + staleTag
         }
         return [claude, codex, devin].filter(shownInMenuBar).map(line).joined(separator: "    ")
     }
