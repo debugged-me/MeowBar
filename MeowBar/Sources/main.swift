@@ -217,6 +217,29 @@ final class UsageStore: ObservableObject {
             if UsageHistory.append(sample, to: &history[u.name, default: []]) { changed = true }
         }
         if changed { AppFiles.save(history, to: AppFiles.history) }
+        if now.timeIntervalSince(lastCachePrune) >= 3600 {
+            lastCachePrune = now
+            pruneCaches(now: now)
+        }
+    }
+
+    private var lastCachePrune = Date.distantPast
+
+    // History and task spans self-prune on append, but a provider that goes
+    // quiet never appends again — its stale tail would sit in memory (and on
+    // disk) forever. An hourly sweep keeps long uptimes from accumulating.
+    private func pruneCaches(now: Date) {
+        let cutoff = now.addingTimeInterval(-UsageHistory.retention)
+        let keptHistory = history.mapValues { $0.filter { $0.t >= cutoff } }
+        if keptHistory != history {
+            history = keptHistory
+            AppFiles.save(history, to: AppFiles.history)
+        }
+        let keptSpans = taskSpans.filter { now.timeIntervalSince($0.end) <= TaskStats.retention }
+        if keptSpans != taskSpans {
+            taskSpans = keptSpans
+            AppFiles.save(taskSpans, to: AppFiles.taskLog)
+        }
     }
 
     // MARK: Session clock
@@ -309,7 +332,10 @@ final class UsageStore: ObservableObject {
                 if self.claudeRunning != c { self.claudeRunning = c }
                 if self.codexRunning != x { self.codexRunning = x }
                 if self.devinRunning != d { self.devinRunning = d }
-                if self.popoverShown && (c || x || d) { self.liveTick = now }
+                // Live durations read in minutes — a 2s publish would redraw
+                // the whole popover for nothing. Tick at 15s instead.
+                if self.popoverShown && (c || x || d),
+                   now.timeIntervalSince(self.liveTick) >= 15 { self.liveTick = now }
                 self.onUpdate?()
             }
         }

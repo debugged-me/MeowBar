@@ -124,15 +124,10 @@ struct PopoverView: View {
             }
             .frame(width: 34, height: 34)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(statusLine.text)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(statusLine.color)
-                    .lineLimit(1)
-                Text("Live usage and pace")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(supportingText(colorScheme))
-            }
+            Text(statusLine.text)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(statusLine.color)
+                .lineLimit(1)
             Spacer()
         }
         .padding(.horizontal, 9)
@@ -295,15 +290,6 @@ struct ProviderBlock: View {
         usage.name == "Devin" ? "Open Devin" : "Open \(usage.name) in Terminal"
     }
 
-    // "12m" / "1h24m" for the running chip — plain "running" for the first
-    // minute, so it never reads "running · <1m".
-    private var liveDuration: String? {
-        guard running, let st = store?.taskStart[usage.name] else { return nil }
-        let elapsed = Date().timeIntervalSince(st)
-        guard elapsed >= 60 else { return nil }
-        return liveDur(elapsed)
-    }
-
     // "now" under a minute, "4 min" under an hour, "1h24m" beyond — a bare
     // "4m" reads as "million" outside a countdown context.
     private func liveDur(_ secs: TimeInterval) -> String {
@@ -388,9 +374,11 @@ struct ProviderBlock: View {
                     name
                 }
                 if running {
+                    // A still dot: the cat is the one live animation, and the
+                    // duration lives in the expanded card's "working 4 min".
                     HStack(spacing: 3) {
-                        LiveDot(color: successColor(colorScheme), live: store?.popoverShown ?? false)
-                        Text("running" + (liveDuration.map { " · \($0)" } ?? ""))
+                        Circle().fill(successColor(colorScheme)).frame(width: 4.5, height: 4.5)
+                        Text("running")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(successColor(colorScheme))
                             .lineLimit(1)
@@ -455,34 +443,44 @@ struct ProviderBlock: View {
             }
 
             if let err = usage.error {
-                // Red only when there's something to fix; transient states
-                // (rate limits, retries) read as information.
-                Text(err)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(usage.action != nil ? Color.red : supportingText(colorScheme))
-                    .fixedSize(horizontal: false, vertical: true)
                 if let action = usage.action {
+                    // Red only when there's something to fix.
+                    Text(err)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Color.red)
+                        .fixedSize(horizontal: false, vertical: true)
                     Button(action.title) {
                         UsageService.perform(action)
                         store?.refresh()
                     }
                     .controlSize(.small)
+                } else {
+                    // Transient states (rate limits, retries) read as
+                    // information: a one-line ⓘ notice while collapsed, the
+                    // full note on expand — or always, when it's all the card has.
+                    Label(err, systemImage: "info.circle")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(supportingText(colorScheme))
+                        .lineLimit(canExpand && !expanded.wrappedValue ? 1 : nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(err)
                 }
             }
 
             let unlimited = usage.noteAccent == "unlimited" && !usage.hasData
             if !unlimited && (usage.hasData || usage.error == nil) {
+                let detailed = expanded.wrappedValue && canExpand
                 let sessionLabel = usage.name == "Devin" ? "Daily · 24h" : "Session · 5h"
                 WindowRow(provider: usage.name, title: sessionLabel, w: usage.session, tint: brandColor,
                           clockStarting: usage.name == "Claude" && store?.clockStarting == true,
-                          animating: store?.popoverShown == true)
+                          animating: store?.popoverShown == true, detailed: detailed)
                 WindowRow(provider: usage.name, title: "Weekly · 7d", w: usage.weekly, tint: brandColor,
-                          animating: store?.popoverShown == true)
+                          animating: store?.popoverShown == true, detailed: detailed)
                 ForEach(usage.extras ?? [], id: \.label) { e in
                     WindowRow(provider: usage.name,
                               title: e.label + extraSpanSuffix(e.window),
                               w: e.window, tint: brandColor,
-                              animating: store?.popoverShown == true)
+                              animating: store?.popoverShown == true, detailed: detailed)
                 }
             }
         }
@@ -524,26 +522,6 @@ struct ProviderBlock: View {
         }
         appeared = false
         withAnimation(.easeOut(duration: 0.26).delay(delay)) { appeared = true }
-    }
-}
-
-// The little pulsing dot next to "running". The repeating animation exists
-// only while `live` — the popover's view outlives the popover, and an
-// always-on pulse would burn CPU around the clock.
-private struct LiveDot: View {
-    let color: Color
-    var live: Bool
-    var body: some View {
-        if live {
-            Circle().fill(color).frame(width: 4.5, height: 4.5)
-                .phaseAnimator([1.0, 0.3]) { dot, opacity in
-                    dot.opacity(opacity)
-                } animation: { _ in
-                    .easeInOut(duration: 0.9)
-                }
-        } else {
-            Circle().fill(color).frame(width: 4.5, height: 4.5)
-        }
     }
 }
 
@@ -686,6 +664,9 @@ struct WindowRow: View {
     var tint: Color = .accentColor
     var clockStarting = false
     var animating = true
+    // Expanded cards show the full readout ("% used" + pace verdict); the
+    // quiet default keeps only the reset, unless pace is already a warning.
+    var detailed = false
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -720,12 +701,14 @@ struct WindowRow: View {
                 }
                 .frame(height: 8)
                 .help(paceHelp)
-                HStack {
-                    Text(bottomText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
-                        .help(resetHelp)
-                    Spacer()
-                    Text(w.paceVerdict()).font(.caption2.weight(.medium)).foregroundStyle(verdictColor)
-                        .help("A guess from your pace so far in this window — it changes as you work")
+                if !bottomText.isEmpty || !verdict.isEmpty {
+                    HStack {
+                        Text(bottomText).font(.caption2.weight(.medium)).foregroundStyle(supportingText(colorScheme)).lineLimit(1)
+                            .help(resetHelp)
+                        Spacer()
+                        Text(verdict).font(.caption2.weight(.medium)).foregroundStyle(verdictColor)
+                            .help("A guess from your pace so far in this window — it changes as you work")
+                    }
                 }
             }
             .accessibilityElement(children: .ignore)
@@ -771,10 +754,18 @@ struct WindowRow: View {
         guard let w else { return "" }
         if w.usedPercent == 0, w.resetsAt == nil { return resetText }
         if w.usedPercent >= 100 { return "" }       // the reset chip says it all
-        if w.usedPercent >= 75 { return resetText } // bar color already says "high"
+        if w.usedPercent >= 75 || !detailed { return resetText } // bar color already says "high"
         return ["\(Int(w.usedPercent))% used", resetText]
             .filter { !$0.isEmpty }
             .joined(separator: " · ")
+    }
+
+    // Collapsed rows keep pace judgments quiet until they're warnings —
+    // "may run out in ~1h" is too useful to hide behind the chevron.
+    private var verdict: String {
+        guard let w else { return "" }
+        if detailed { return w.paceVerdict() }
+        return [.warn, .bad].contains(w.paceSeverity()) ? w.paceVerdict() : ""
     }
 
     private var barColor: Color {

@@ -361,9 +361,11 @@ private final class CodexTurnTracker: @unchecked Sendable {
     private struct State {
         var offset: UInt64 = 0
         var active = false
+        var seen = Date()
     }
 
     private var states: [String: State] = [:]
+    private var nextPrune = Date.distantPast
     private let lock = NSLock()
 
     func isActive(rolloutPath: String) -> Bool {
@@ -391,7 +393,14 @@ private final class CodexTurnTracker: @unchecked Sendable {
             if marker == "task_complete" { state.active = false }
         }
         state.offset = end
+        state.seen = Date()
         states[rolloutPath] = state
+        // One entry per rollout path ever seen: sweep states untouched for
+        // 2h (long off the recent-threads query) or they'd grow for weeks.
+        if state.seen >= nextPrune {
+            nextPrune = state.seen.addingTimeInterval(600)
+            states = states.filter { state.seen.timeIntervalSince($0.value.seen) < 2 * 3600 }
+        }
         return state.active
     }
 }
@@ -415,6 +424,10 @@ private final class ClaudeTurnTracker: @unchecked Sendable {
         if now >= discoverAfter {
             candidates = discoverRecentTranscripts()
             discoverAfter = now.addingTimeInterval(10)
+            // Offsets for transcripts that left the recent set are dead
+            // weight — dropping them keeps `states` bounded indefinitely.
+            let keep = Set(candidates)
+            states = states.filter { keep.contains($0.key) }
         }
         for path in candidates {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),

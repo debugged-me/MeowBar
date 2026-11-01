@@ -8,3 +8,5 @@ Thumbs.db
 Desktop.ini
 /version.json
 .build/
+mobile/usage.json
+mobile
